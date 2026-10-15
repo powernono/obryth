@@ -1,0 +1,145 @@
+import { useCallback, useEffect, useState } from "react";
+import { notify } from "./notifications/notifications";
+import { applyDesktopSnapshotPatch, mergeDesktopSnapshotPatches } from "../../shared/snapshot-patch";
+import type { DesktopSnapshot, DesktopSnapshotPatch } from "../../shared/types";
+
+const snapshotKeys = [
+  "daemon",
+  "projects",
+  "projectAliases",
+  "pinnedProjectPaths",
+  "pinnedSessionIds",
+  "archivedSessionIds",
+  "unreadSessionIds",
+  "workflowTemplates",
+  "devices",
+  "accounts",
+  "orchestration",
+  "logs",
+  "settings",
+] as const satisfies readonly (keyof DesktopSnapshot)[];
+
+export function desktopSnapshotFromPatch(
+  patch: DesktopSnapshotPatch,
+): DesktopSnapshot | undefined {
+  if (!snapshotKeys.every((key) => Object.hasOwn(patch, key))) return undefined;
+  if (!patch.daemon || !Object.hasOwn(patch.daemon, "sessions")) return undefined;
+  return patch as DesktopSnapshot;
+}
+
+export type DesktopSnapshotState = {
+  snapshot: DesktopSnapshot | undefined;
+  error: string | undefined;
+  retry: () => void;
+};
+
+export function useDesktopSnapshot(): DesktopSnapshotState {
+  const [snapshot, setSnapshot] = useState<DesktopSnapshot>();
+  const [error, setError] = useState<string>();
+  const [attempt, setAttempt] = useState(0);
+  const retry = useCallback((): void => {
+    setError(undefined);
+    setAttempt((current) => current + 1);
+  }, []);
+  useEffect(() => {
+    let active = true;
+    let loaded = false;
+    let pendingPatch: DesktopSnapshotPatch = {};
+    void window.prospero.getSnapshot()
+      .then((next) => {
+        if (!active || loaded) return;
+        loaded = true;
+        setError(undefined);
+        setSnapshot(applyDesktopSnapshotPatch(next, pendingPatch));
+        pendingPatch = {};
+      })
+      .catch((reason: unknown) => {
+        if (!active || loaded) return;
+        const initial = desktopSnapshotFromPatch(pendingPatch);
+        if (initial) {
+          loaded = true;
+          pendingPatch = {};
+          setError(undefined);
+          setSnapshot(initial);
+          return;
+        }
+        setError(reportError(reason));
+      });
+    const unsubscribe = window.prospero.subscribeSnapshot((patch) => {
+      if (!active) return;
+      if (!loaded) {
+        const initial = desktopSnapshotFromPatch(patch);
+        if (initial) {
+          loaded = true;
+          pendingPatch = {};
+          setError(undefined);
+          setSnapshot(initial);
+          return;
+        }
+        pendingPatch = mergeDesktopSnapshotPatches(pendingPatch, patch);
+        return;
+      }
+      setSnapshot((current) => current ? applyDesktopSnapshotPatch(current, patch) : current);
+    });
+    return () => { active = false; unsubscribe(); };
+  }, [attempt]);
+  return { snapshot, error, retry };
+}
+
+export function reportError(error: unknown): string {
+  const message = displayError(error);
+  if (!isMissingSessionMessage(message)) notify({ kind: "error", message });
+  return message;
+}
+
+export function isMissingSessionError(error: unknown): boolean {
+  return isMissingSessionMessage(displayError(error));
+}
+
+export function isUnrecoverableTerminalError(error: unknown): boolean {
+  const message = displayError(error);
+  return message.includes("无法可靠恢复画面") || message.includes("终端历史已裁剪");
+}
+
+export function displayError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/^Error invoking remote method '[^']+':\s*/, "");
+}
+
+function isMissingSessionMessage(message: string): boolean {
+  return /(?:^|\b)(?:session_not_found|no such session)\b/i.test(message);
+}
+
+export function text(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+export function number(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+export function array(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+export function record(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+export function shortPath(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  const separator = path.includes("/") ? "/" : "\\";
+  return parts.slice(-2).join(separator) || path;
+}
+
+export function statusLabel(status: string): string {
+  return ({
+    running: "运行中", starting: "启动中", idle: "空闲", waiting_approval: "等待审批",
+    waiting_input: "等待输入", completed: "已完成", done: "已完成", died: "已终止",
+    pending: "待处理", ready: "可执行", dispatched: "已派发", blocked: "受阻", failed: "失败", cancelled: "已取消",
+    active: "进行中", paused: "已暂停", abandoned: "已放弃", signed_in: "已登录", signed_out: "未登录",
+    unavailable: "CLI 未安装", error: "错误", connected: "已连接", connecting: "连接中", disabled: "未启用", offline: "离线",
+  } as Record<string, string>)[status] ?? (status || "未知");
+}

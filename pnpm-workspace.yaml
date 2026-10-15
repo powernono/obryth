@@ -1,0 +1,17 @@
+packages:
+  - apps/desktop
+  - apps/mobile
+  - packages/*
+  - extensions/*
+  - vendor/prospero/packages/protocol
+verifyDepsBeforeRun: false
+allowBuilds:
+  esbuild: true
+minimumReleaseAgeExclude:
+  - '@tiptap/extension-bubble-menu@3.32.0'
+  - '@tiptap/extension-code-block@3.32.0'
+  - '@tiptap/extension-dropcursor@3.32.0'
+  - '@tiptap/extension-link@3.32.0'
+  - '@tiptap/extension-text@3.32.0'
+  - '@tiptap/markdown@3.32.0'
+  - '@tiptap/starter-kit@3.32.0'

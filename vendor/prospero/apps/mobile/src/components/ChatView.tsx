@@ -1,0 +1,2131 @@
+/**
+ * 结构化会话视图:消息流 + 工具卡片 + 审批卡片。
+ * 事件→条目的折叠逻辑在 lib/chat-model,这里只负责渲染与交互。
+ */
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import * as Clipboard from "expo-clipboard";
+import * as Haptics from "expo-haptics";
+import {
+  ActivityIndicator,
+  FlatList,
+  Image,
+  InteractionManager,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  TextInput,
+  View,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
+} from "react-native";
+import { ConversationText as Text, useConversationFontScale } from "./ConversationTypography";
+import { scaleConversationTextStyle } from "@/lib/conversation-font-size";
+import {
+  fromB64,
+  toB64,
+  type AgentKind,
+  type AgentQuestionAnswer,
+  type AgentUserAttachment,
+  type PermissionReply,
+  type SessionStatus,
+  type SubagentStatus,
+} from "@prospero/protocol";
+import { pollFocusedSubagent, subscribeFocusedChat } from "@/lib/focused-session-stream";
+import { useFocusedSessionEffect } from "@/lib/use-focused-session-effect";
+import { ChatScrollFollow, isAtLatestChatOffset, newestChatItemsFirst } from "@/lib/chat-scroll-follow";
+import { AgentIcon, agentTint } from "@/components/AgentIcon";
+import { DiffView } from "@/components/DiffView";
+import { Icon } from "@/components/Icon";
+import { Markdown, type ProjectImageLoader } from "@/components/Markdown";
+import { Sheet } from "@/components/Sheet";
+import { toast } from "@/components/Toast";
+import type { HostConnection } from "@/lib/connection";
+import {
+  resolveProjectFileReference,
+  type ProjectFileReference,
+} from "@/lib/file-references";
+import { MONOSPACE_FONT, radius, createThemedStyles, useMobileTheme } from "@/lib/theme";
+import { resultFiles } from "@/lib/result-files";
+import { textInSelection, type TextSelectionRange } from "@/lib/text-selection";
+import {
+  applyEvents,
+  applyToolOutput,
+  foldChatItems,
+  foldCodexTurns,
+  itemsForAgent,
+  pendingInteractions,
+  type AssistantItem,
+  type ChatDisplayItem,
+  type ChatItem,
+  type ErrorItem,
+  type FoldableActivityItem,
+  type PermissionItem,
+  type QuestionItem,
+  type SubagentItem,
+  type ToolItem,
+  type TrajectoryItem,
+  type TurnDiffSummaryItem,
+  type UserItem,
+} from "@/lib/chat-model";
+import {
+  createUserAttachmentLoader,
+  createUserAttachmentPreviewLoadController,
+  type UserAttachmentLoader,
+  type UserAttachmentPreviewLoadController,
+  type UserAttachmentPreviewLoadState,
+} from "@/lib/user-attachment-loader";
+
+interface Props {
+  conn: HostConnection;
+  sid: string;
+  /** 上报给会话页,用于显示"N 项待批"与快捷回复的忙碌态 */
+  onPendingChange?: (count: number) => void;
+  /** 搜索关键词;非空时只显示命中的条目 */
+  search?: string;
+  /** 出错时可重发上一条用户消息 */
+  onRetry?: (text: string) => void;
+  /** 本地即时回显；服务端出现对应 user event 后自动移除。 */
+  pendingOutgoing?: { token: string; text: string } | null;
+  /** agent 回复里的项目文件引用可直接打开只读预览。 */
+  projectRoot?: string;
+  onOpenFile?: (reference: ProjectFileReference) => void;
+  /** 复用对话流底部的 agent 身份提示，不另占一条顶部状态栏。 */
+  agent?: AgentKind;
+  workingStatus?: SessionStatus | SubagentStatus;
+  onInterrupt?: () => void;
+  /** 省略显示主 Agent；有值时复用同一事件流展示该子 Agent 的独立对话。 */
+  subagentId?: string;
+  onOpenSubagent?: (subagentId: string) => void;
+  /** DeepSeek 可在普通对话与完整执行轨迹之间切换。 */
+  viewMode?: "chat" | "trajectory";
+}
+
+const PROJECT_IMAGE_CHUNK = 192 * 1024;
+const MAX_PROJECT_IMAGE_BYTES = 6 * 1024 * 1024;
+
+function projectImageMime(path: string): string {
+  const extension = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+  if (extension === "png") return "image/png";
+  if (extension === "jpg" || extension === "jpeg") return "image/jpeg";
+  if (extension === "gif") return "image/gif";
+  if (extension === "webp") return "image/webp";
+  throw new Error("只支持 PNG、JPEG、GIF 与 WebP 图片");
+}
+
+const chatKeyExtractor = (i: ChatDisplayItem): string => i.key;
+const isScrollAtBottom = (event: NativeScrollEvent): boolean =>
+  isAtLatestChatOffset(event.contentOffset.y);
+const CHAT_VISIBLE_POSITION = { minIndexForVisible: 0 } as const;
+
+export const ChatView = memo(function ChatView(props: Props) {
+  // Router can reuse this component for another session; its state/cursor must not follow it.
+  return <ChatViewContent key={`${props.conn.host.id}\u0000${props.sid}`} {...props} />;
+});
+
+const ChatViewContent = memo(function ChatViewContent({
+  conn,
+  sid,
+  onPendingChange,
+  search,
+  onRetry,
+  pendingOutgoing,
+  projectRoot,
+  onOpenFile,
+  agent,
+  workingStatus,
+  onInterrupt,
+  subagentId,
+  onOpenSubagent,
+  viewMode = "chat",
+}: Props) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const [items, setItems] = useState<ChatItem[]>([]);
+  /** 带 id 防止路由切换瞬间把上一个子 Agent 的历史短暂画到新页面。 */
+  const [subagentHistory, setSubagentHistory] = useState<{
+    subagentId: string;
+    items: ChatItem[];
+  } | null>(null);
+  const listRef = useRef<FlatList<ChatDisplayItem>>(null);
+  const imageCacheRef = useRef(new Map<string, Promise<string>>());
+  const attachmentCacheRef = useRef(new Map<string, Promise<string>>());
+  const evSeqRef = useRef(0);
+  const scrollFollow = useRef(new ChatScrollFollow());
+  const [hasUnread, setHasUnread] = useState(false);
+  // Kept outside virtualized rows: scrolling a capsule offscreen must not reset it.
+  const [turnExpansion, setTurnExpansion] = useState<Record<string, boolean>>({});
+  const toggleTurn = useCallback((key: string, expanded: boolean) => {
+    scrollFollow.current.beginDrag();
+    scrollFollow.current.endDrag(false);
+    setTurnExpansion((previous) => ({ ...previous, [key]: !expanded }));
+  }, []);
+  const [selectionSource, setSelectionSource] = useState<string | null>(null);
+  const pendingOutgoingRef = useRef(pendingOutgoing);
+  const [acknowledgedPendingToken, setAcknowledgedPendingToken] = useState<string | null>(null);
+  const snapshotGeneration = useRef(0);
+  useEffect(() => {
+    pendingOutgoingRef.current = pendingOutgoing;
+  }, [pendingOutgoing]);
+
+  const loadProjectImage = useCallback<ProjectImageLoader>(
+    (reference) => {
+      const key = `${sid}\u0000${reference.path}`;
+      const cached = imageCacheRef.current.get(key);
+      if (cached) return cached;
+      const request = (async (): Promise<string> => {
+        const mime = projectImageMime(reference.path);
+        let offset = 0;
+        let total: number | null = null;
+        let bytes: Uint8Array | null = null;
+        // 用 while(true) 而非 for(;;):后者会让 React Compiler 放弃优化整个 ChatView。
+        while (true) {
+          const chunk = await conn.fsGetChunk(sid, reference.path, offset, PROJECT_IMAGE_CHUNK);
+          if (total === null) {
+            total = chunk.total;
+            if (total <= 0) throw new Error("图片文件为空");
+            if (total > MAX_PROJECT_IMAGE_BYTES) throw new Error("图片超过 6 MB，请点按打开预览");
+            bytes = new Uint8Array(total);
+          } else if (chunk.total !== total) {
+            throw new Error("读取图片时文件大小发生了变化");
+          }
+          const part = fromB64(chunk.dataB64);
+          if (!bytes || offset + part.byteLength > bytes.byteLength) {
+            throw new Error("图片分块响应无效");
+          }
+          bytes.set(part, offset);
+          offset += part.byteLength;
+          if (chunk.eof) break;
+          if (part.byteLength === 0) throw new Error("图片传输提前中断");
+        }
+        if (!bytes || total === null || offset !== total) throw new Error("图片传输不完整");
+        return `data:${mime};base64,${toB64(bytes)}`;
+      })().catch((error: unknown) => {
+        imageCacheRef.current.delete(key);
+        throw error;
+      });
+      if (imageCacheRef.current.size >= 12) {
+        const oldest = imageCacheRef.current.keys().next().value as string | undefined;
+        if (oldest) imageCacheRef.current.delete(oldest);
+      }
+      imageCacheRef.current.set(key, request);
+      return request;
+    },
+    [conn, sid],
+  );
+
+  const loadUserAttachment = useCallback<UserAttachmentLoader>(
+    (msgId, attachment) => createUserAttachmentLoader({
+      sid,
+      cache: attachmentCacheRef.current,
+      readChunk: (chunkMsgId, attachmentId, offset, length) => conn.chatAttachmentChunk(
+        sid,
+        chunkMsgId,
+        attachmentId,
+        offset,
+        length,
+      ),
+    })(msgId, attachment),
+    [conn, sid],
+  );
+
+  useFocusedSessionEffect(useCallback(() => subscribeFocusedChat({
+    conn, sid, cursor: evSeqRef,
+    snapshot: (events) => {
+      if (events.some((event) => event.kind === "user.message")) {
+        setAcknowledgedPendingToken(pendingOutgoingRef.current?.token ?? null);
+      }
+      // Do not parse a large history in the same JS turn as the route transition.
+      // Let the native navigation and the first frame become interactive first;
+      // this is especially important on iOS where Markdown/tool folding can
+      // otherwise make a successful tap look lost.
+      const generation = ++snapshotGeneration.current;
+      setItems([]);
+      InteractionManager.runAfterInteractions(() => {
+        if (generation !== snapshotGeneration.current) return;
+        setItems(applyEvents([], events));
+      });
+    },
+    events: (events) => {
+      if (events.some((event) => event.kind === "user.message")) {
+        setAcknowledgedPendingToken(pendingOutgoingRef.current?.token ?? null);
+      }
+      setItems((previous) => applyEvents(previous, events));
+    },
+    toolOutput: (message) => setItems((previous) =>
+      applyToolOutput(previous, message.callId, message.output, message.truncated === true)),
+    unread: () => { if (!scrollFollow.current.following) setHasUnread(true); },
+  }), [conn, sid]));
+
+  useFocusedSessionEffect(useCallback(() => {
+    if (!subagentId) return () => undefined;
+    return pollFocusedSubagent({
+      conn, sid, subagentId,
+      receive: (events) => setSubagentHistory({ subagentId, items: applyEvents([], events) }),
+    });
+  }, [conn, sid, subagentId]));
+
+  const scopedItems = useMemo(
+    () =>
+      subagentId && subagentHistory?.subagentId === subagentId
+        ? subagentHistory.items
+        : itemsForAgent(items, subagentId),
+    [items, subagentId, subagentHistory],
+  );
+  const visiblePendingOutgoing = pendingOutgoing &&
+    pendingOutgoing.token !== acknowledgedPendingToken
+    ? pendingOutgoing
+    : null;
+
+  // 自动跟随只留 onContentSizeChange 一条路径。这里再排一次 rAF 会在同一帧里
+  // 重复滚动,而且它跑在列表重新布局【之前】,量到的还是上一帧的内容高度。
+  const pendingCount = useMemo(() => pendingInteractions(scopedItems).length, [scopedItems]);
+  useEffect(() => {
+    onPendingChange?.(pendingCount);
+  }, [pendingCount, onPendingChange]);
+
+  const respond = useCallback(
+    (reqId: string, reply: PermissionReply) => {
+      // 审批是全 App 最高风险的点击,给一次触觉确认
+      void Haptics.notificationAsync(
+        reply === "reject"
+          ? Haptics.NotificationFeedbackType.Warning
+          : Haptics.NotificationFeedbackType.Success,
+      );
+      conn.respondPermission(sid, reqId, reply);
+    },
+    [conn, sid],
+  );
+
+  const fetchOutput = useCallback(
+    (callId: string) => conn.getToolOutput(sid, callId),
+    [conn, sid],
+  );
+
+  const answerQuestion = useCallback(
+    (reqId: string, answers: AgentQuestionAnswer[], cancelled = false) => {
+      void Haptics.notificationAsync(
+        cancelled
+          ? Haptics.NotificationFeedbackType.Warning
+          : Haptics.NotificationFeedbackType.Success,
+      );
+      conn.respondQuestion(sid, reqId, answers, cancelled);
+    },
+    [conn, sid],
+  );
+
+  // 流式期间 scopedItems 每帧都是新数组。retry 只在点击时才需要读它,
+  // 直接依赖会让 renderItem 跟着每帧换引用,memo 过的气泡就全部白重渲染。
+  const scopedItemsRef = useRef(scopedItems);
+  useEffect(() => {
+    scopedItemsRef.current = scopedItems;
+  }, [scopedItems]);
+
+  const retry = useCallback(() => {
+    // 找最后一条用户消息重发
+    const current = scopedItemsRef.current;
+    for (let i = current.length - 1; i >= 0; i--) {
+      const it = current[i]!;
+      if (it.type === "user") {
+        onRetry?.(it.text);
+        return;
+      }
+    }
+  }, [onRetry]);
+
+  const visible = useMemo(() => {
+    const source = viewMode === "trajectory"
+      ? scopedItems.filter((item) =>
+          item.type === "trajectory" ||
+          item.type === "tool" ||
+          item.type === "permission" ||
+          item.type === "question" ||
+          item.type === "error")
+      : scopedItems.filter((item) => item.type !== "trajectory");
+    const q = search?.trim().toLowerCase() ?? "";
+    if (q.length > 0) {
+      // 搜索结果逐条展开，否则命中项可能藏在活动组里。
+      return source.filter((i) => i.type !== "turn-end" && itemText(i).toLowerCase().includes(q));
+    }
+    return viewMode === "trajectory" ? source : agent === "codex" ? foldCodexTurns(source, turnExpansion) : foldChatItems(source);
+  }, [scopedItems, search, viewMode, agent, turnExpansion]);
+  // The latest cells mount first at offset zero; no estimated long-history end is needed.
+  const newestFirst = useMemo(() => newestChatItemsFirst(visible), [visible]);
+
+  const jumpToBottom = useCallback(() => {
+    scrollFollow.current.followLatest();
+    setHasUnread(false);
+    listRef.current?.scrollToOffset({ offset: 0, animated: true });
+  }, []);
+
+  // 内联写在 JSX 里的话每次渲染都是新函数,FlatList 会据此重建所有 cell,
+  // 下面那些 memo() 过的气泡就一个都拦不住。依赖项全部是稳定引用。
+  const renderItem = useCallback(
+    ({ item }: { item: ChatDisplayItem }) => {
+      switch (item.type) {
+        case "turn-end":
+          return null;
+        case "turn-activity":
+          return <Pressable testID={`codex-${item.key}`} accessibilityRole="button"
+            accessibilityState={{ expanded: item.expanded }}
+            accessibilityLabel={`${item.completed ? "本轮执行过程" : "正在执行"}，${item.count} 项，${item.expanded ? "收起" : "展开"}`}
+            onPress={() => toggleTurn(item.stateKey, item.expanded)}
+            style={({ pressed }) => [styles.turnCapsule, pressed && styles.inlinePressed]}>
+            {!item.completed && <ActivityIndicator size="small" color={color.accent} />}
+            <Icon name={item.expanded ? "chevron.down" : "chevron.right"} size={12} color={color.textDim} />
+            <Text style={styles.turnCapsuleText}>{item.completed ? "执行过程" : "正在执行"} · {item.count} 项</Text>
+            <Text style={styles.turnCapsuleHint}>{item.expanded ? "收起" : "展开"}</Text>
+          </Pressable>;
+        case "user":
+          return <UserBubble item={item} loadAttachment={loadUserAttachment} />;
+        case "assistant":
+          return (
+            <AssistantBubble
+              item={item}
+              projectRoot={projectRoot}
+              onOpenFile={onOpenFile}
+              loadProjectImage={loadProjectImage}
+              onSelectCopy={setSelectionSource}
+              showFiles={agent === "codex" && item.done && item.text.length > 0}
+              reasoningExpanded={agent === "codex"}
+            />
+          );
+        case "tool":
+          return <ToolCard item={item} onFetchOutput={fetchOutput} />;
+        case "permission":
+          return <PermissionCard item={item} onRespond={respond} />;
+        case "question":
+          return <QuestionCard item={item} onRespond={answerQuestion} />;
+        case "subagent":
+          return <SubagentCard item={item} onOpen={onOpenSubagent} />;
+        case "error":
+          return <ErrorCard item={item} onRetry={onRetry ? retry : undefined} />;
+        case "trajectory":
+          return <TrajectoryCard item={item} />;
+        case "turn-diff-summary":
+          return (
+            <TurnDiffSummaryBar
+              item={item}
+              projectRoot={projectRoot}
+              onOpenFile={onOpenFile}
+            />
+          );
+        case "activity-group":
+          return (
+            <ActivityGroup item={item} onFetchOutput={fetchOutput} onRespond={respond} />
+          );
+      }
+    },
+    [
+      loadUserAttachment,
+      projectRoot,
+      onOpenFile,
+      loadProjectImage,
+      fetchOutput,
+      respond,
+      answerQuestion,
+      onOpenSubagent,
+      onRetry,
+      retry,
+      toggleTurn,
+      agent,
+      color,
+      styles,
+    ],
+  );
+
+  const listEmpty = useMemo(
+    () =>
+      workingStatus ? null : (
+        <View style={styles.empty}>
+          <View style={styles.emptyIcon}>
+            <Icon
+              name={search ? "magnifyingglass" : "bubble.left.and.text.bubble.right"}
+              size={22}
+              color={color.textFaint}
+            />
+          </View>
+          <Text style={styles.emptyTitle}>{search ? "没有找到消息" : "准备好了"}</Text>
+          <Text style={styles.emptyText}>
+            {search ? "换个关键词试试" : "描述目标，或从下方快捷回复开始"}
+          </Text>
+        </View>
+      ),
+    [workingStatus, search, color.textFaint, styles],
+  );
+
+  const listHeader = useMemo(
+    () =>
+      agent && workingStatus ? (
+        <AgentWorkingIndicator
+          agent={agent}
+          status={workingStatus}
+          onInterrupt={onInterrupt}
+        />
+      ) : null,
+    [agent, workingStatus, onInterrupt],
+  );
+  const listHeaderWithPending = useMemo(
+    () => (
+      <>
+        {visiblePendingOutgoing && (
+          <View style={styles.pendingOutgoingBubble} accessibilityLiveRegion="polite">
+            <Text style={styles.pendingOutgoingText}>{visiblePendingOutgoing.text}</Text>
+            <Text style={styles.pendingOutgoingStatus}>发送中…</Text>
+          </View>
+        )}
+        {listHeader}
+      </>
+    ),
+    [listHeader, visiblePendingOutgoing, styles],
+  );
+
+  const handleContentSizeChange = useCallback(() => {
+    if (!scrollFollow.current.following) return;
+    // Inversion makes the latest edge exact even while older Markdown rows are unmeasured.
+    scrollFollow.current.followLatest();
+    listRef.current?.scrollToOffset({ offset: 0, animated: false });
+  }, []);
+
+  // hasUnread 走 ref:直接读 state 会让 onScroll 在每次未读标记变化时换引用。
+  const hasUnreadRef = useRef(hasUnread);
+  useEffect(() => {
+    hasUnreadRef.current = hasUnread;
+  }, [hasUnread]);
+
+  const handleScroll = useCallback(
+    (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const bottom = isScrollAtBottom(e.nativeEvent);
+      scrollFollow.current.scrolled(bottom);
+      if (bottom && hasUnreadRef.current) setHasUnread(false);
+    },
+    [],
+  );
+
+  const handleScrollBeginDrag = useCallback(() => scrollFollow.current.beginDrag(), []);
+  const handleScrollEndDrag = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    scrollFollow.current.endDrag(isScrollAtBottom(e.nativeEvent), e.nativeEvent.velocity?.y);
+    if (scrollFollow.current.following) setHasUnread(false);
+  }, []);
+  const handleMomentumScrollBegin = useCallback(() => scrollFollow.current.beginMomentum(), []);
+  const handleMomentumScrollEnd = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    scrollFollow.current.endMomentum(isScrollAtBottom(e.nativeEvent));
+    if (scrollFollow.current.following) setHasUnread(false);
+  }, []);
+
+  return (
+    <View style={styles.root}>
+      <FlatList
+        ref={listRef}
+        data={newestFirst}
+        inverted
+        maintainVisibleContentPosition={CHAT_VISIBLE_POSITION}
+        keyExtractor={chatKeyExtractor}
+        style={styles.list}
+        contentContainerStyle={styles.content}
+        onContentSizeChange={handleContentSizeChange}
+        onScroll={handleScroll}
+        onScrollBeginDrag={handleScrollBeginDrag}
+        onScrollEndDrag={handleScrollEndDrag}
+        onMomentumScrollBegin={handleMomentumScrollBegin}
+        onMomentumScrollEnd={handleMomentumScrollEnd}
+        scrollEventThrottle={32}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
+        removeClippedSubviews={Platform.OS === "android"}
+        initialNumToRender={12}
+        maxToRenderPerBatch={8}
+        // iOS 上 removeClippedSubviews 不可靠,只能靠窗口本身收窄挂载量。气泡里
+        // 有 Markdown、diff 和图片,十一屏的量在长会话里就是白挂着的原生视图。
+        windowSize={7}
+        ListEmptyComponent={listEmpty}
+        ListHeaderComponent={listHeaderWithPending}
+        renderItem={renderItem}
+      />
+      {hasUnread && (
+        <Pressable
+          style={({ pressed }) => [styles.jumpBtn, pressed && styles.jumpBtnPressed]}
+          onPress={jumpToBottom}
+          accessibilityRole="button"
+          accessibilityLabel="跳到最新内容"
+        >
+          <Text style={styles.jumpText}>查看新内容 ↓</Text>
+        </Pressable>
+      )}
+      <SelectionCopySheet
+        visible={selectionSource !== null}
+        source={selectionSource ?? ""}
+        onClose={() => setSelectionSource(null)}
+      />
+    </View>
+  );
+});
+
+const agentLabel: Record<AgentKind, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  deepseek: "DeepSeek Harness",
+  opencode: "OpenCode",
+  grok: "Grok",
+  trae: "Trae",
+  shell: "Shell",
+  custom: "Agent",
+};
+
+function AgentWorkingIndicator({
+  agent,
+  status,
+  onInterrupt,
+}: {
+  agent: AgentKind;
+  status: SessionStatus | SubagentStatus;
+  onInterrupt?: () => void;
+}) {
+  const styles = useStyles();
+  const { palette: color, scheme } = useMobileTheme();
+  const tint = agentTint(agent, scheme);
+  const waiting = status === "waiting_approval" || status === "waiting_input";
+  const label = waiting
+    ? status === "waiting_input"
+      ? `${agentLabel[agent]} 等待你的回答`
+      : `${agentLabel[agent]} 等待你的批准`
+    : status === "starting"
+      ? `正在启动 ${agentLabel[agent]}`
+      : `${agentLabel[agent]} 正在工作`;
+  return (
+    <View
+      style={styles.agentWorking}
+      accessible
+      accessibilityLiveRegion="polite"
+      accessibilityLabel={label}
+    >
+      <AgentIcon agent={agent} size={14} badge />
+      {!waiting && <ActivityIndicator size="small" color={tint} />}
+      <Text style={[styles.agentWorkingText, { color: waiting ? color.warn : tint }]}>
+        {label}
+      </Text>
+      <Text style={styles.agentWorkingHint} numberOfLines={1}>
+        {waiting ? "处理后自动继续" : "可继续排队或引导"}
+      </Text>
+      {onInterrupt && (
+        <Pressable
+          style={({ pressed }) => [styles.agentStop, pressed && styles.agentStopPressed]}
+          onPress={() => {
+            void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+            onInterrupt();
+          }}
+          accessibilityRole="button"
+          accessibilityLabel={`停止 ${agentLabel[agent]} 当前任务`}
+        >
+          <Icon name="stop.circle" size={13} color={color.danger} />
+          <Text style={styles.agentStopText}>停止</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
+function itemText(i: ChatItem): string {
+  switch (i.type) {
+    case "turn-end":
+      return "";
+    case "user":
+      return i.text;
+    case "assistant":
+      return i.text + i.reasoning;
+    case "tool":
+      return `${i.tool} ${i.input} ${i.result ?? ""}`;
+    case "permission":
+      return `${i.action} ${i.resources.join(" ")}`;
+    case "question":
+      return i.questions.map((question) => question.question).join(" ");
+    case "subagent":
+      return `${i.subagent.name} ${i.subagent.role ?? ""} ${i.subagent.task ?? ""} ${i.subagent.preview ?? ""}`;
+    case "error":
+      return i.message;
+    case "trajectory":
+      return `${i.title} ${i.detail ?? ""}`;
+    case "turn-diff-summary":
+      return i.files.map((file) => file.path).join(" ");
+  }
+}
+
+/** 长按复制:手机上把 agent 输出拷走的唯一顺手方式,附触觉确认 */
+function useCopy(): (text: string, what?: string) => void {
+  return useCallback((text: string, what = "内容") => {
+    void Clipboard.setStringAsync(text);
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    // 只给触感等于没反馈 —— 静音/关掉触感的手机上完全看不出来复制成功了
+    toast(`已复制${what}`);
+  }, []);
+}
+
+function SelectionCopySheet({
+  visible,
+  source,
+  onClose,
+}: {
+  visible: boolean;
+  source: string;
+  onClose: () => void;
+}) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const [selection, setSelection] = useState<TextSelectionRange>({ start: 0, end: 0 });
+  const readingScale = useConversationFontScale();
+  const copy = useCopy();
+  const selected = textInSelection(source, selection);
+
+  useEffect(() => {
+    if (!visible) return;
+    const reset = setTimeout(() => setSelection({ start: 0, end: 0 }), 0);
+    return () => clearTimeout(reset);
+  }, [visible, source]);
+
+  return (
+    <Sheet visible={visible} title="选择复制" onClose={onClose}>
+      <Text style={styles.selectionHelp}>
+        长按文字后拖动两端，只圈选需要的部分；选好后点“复制所选”。
+      </Text>
+      <TextInput
+        value={source}
+        onChangeText={() => {}}
+        onSelectionChange={(event) => setSelection(event.nativeEvent.selection)}
+        style={scaleConversationTextStyle(styles.selectionInput, readingScale)}
+        multiline
+        scrollEnabled
+        showSoftInputOnFocus={false}
+        selectTextOnFocus={false}
+        selectionColor={color.accent}
+        autoCorrect={false}
+        spellCheck={false}
+        accessibilityLabel="可选择的完整回复"
+        accessibilityHint="长按并拖动选择句子，然后使用下方复制所选按钮"
+      />
+      <View style={styles.selectionActions}>
+        <Pressable
+          style={({ pressed }) => [
+            styles.selectionPrimary,
+            selected.length === 0 && styles.selectionDisabled,
+            pressed && selected.length > 0 && styles.inlinePressed,
+          ]}
+          disabled={selected.length === 0}
+          onPress={() => {
+            copy(selected, "所选文字");
+            onClose();
+          }}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: selected.length === 0 }}
+        >
+          <Text style={styles.selectionPrimaryText}>
+            {selected.length > 0 ? `复制所选（${String(selected.length)} 字）` : "请先选择文字"}
+          </Text>
+        </Pressable>
+        <Pressable
+          style={({ pressed }) => [styles.selectionSecondary, pressed && styles.inlinePressed]}
+          onPress={() => {
+            copy(source, "完整回复");
+            onClose();
+          }}
+          accessibilityRole="button"
+        >
+          <Text style={styles.selectionSecondaryText}>复制全文</Text>
+        </Pressable>
+      </View>
+    </Sheet>
+  );
+}
+
+const UserBubble = memo(function UserBubble({
+  item,
+  loadAttachment,
+}: {
+  item: UserItem;
+  loadAttachment: UserAttachmentLoader;
+}) {
+  const styles = useStyles();
+  return (
+    <View style={styles.userRow}>
+      <View style={styles.userBubble}>
+        {item.text.length > 0 && (
+          <Text style={styles.userText} selectable>
+            {item.text}
+          </Text>
+        )}
+        {item.attachments && item.attachments.length > 0 && (
+          <View style={styles.userAttachments}>
+            {item.attachments.map((attachment) => (
+              <UserAttachmentPreview
+                key={attachment.id}
+                msgId={item.msgId}
+                attachment={attachment}
+                loadAttachment={loadAttachment}
+              />
+            ))}
+          </View>
+        )}
+      </View>
+    </View>
+  );
+});
+
+const UserAttachmentPreview = memo(function UserAttachmentPreview({
+  msgId,
+  attachment,
+  loadAttachment,
+}: {
+  msgId: string;
+  attachment: AgentUserAttachment;
+  loadAttachment: UserAttachmentLoader;
+}) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const [state, setState] = useState<UserAttachmentPreviewLoadState>({
+    status: "loading",
+    uri: null,
+    error: null,
+  });
+  const controllerRef = useRef<UserAttachmentPreviewLoadController | null>(null);
+
+  useEffect(() => {
+    const controller = createUserAttachmentPreviewLoadController(() =>
+      loadAttachment(msgId, attachment),
+    );
+    controllerRef.current = controller;
+    const unsubscribe = controller.subscribe(setState);
+    void controller.load();
+    return () => {
+      unsubscribe();
+      controller.dispose();
+      if (controllerRef.current === controller) controllerRef.current = null;
+    };
+  }, [attachment, loadAttachment, msgId]);
+
+  if (state.status === "loaded") {
+    return <Image source={{ uri: state.uri }} style={styles.userAttachmentImage} resizeMode="cover" />;
+  }
+  const attachmentName = attachment.name || "图片附件";
+  const failed = state.status === "failed";
+  return (
+    <Pressable
+      disabled={!failed}
+      onPress={() => void controllerRef.current?.load()}
+      style={({ pressed }) => [
+        styles.userAttachmentPlaceholder,
+        failed && styles.userAttachmentRetry,
+        pressed && failed && styles.inlinePressed,
+      ]}
+      accessibilityRole="button"
+      accessibilityState={{ disabled: !failed }}
+      accessibilityLabel={failed
+        ? `${attachmentName}，图片加载失败：${state.error}。点按重试`
+        : `${attachmentName}，正在加载图片`}
+      accessibilityHint={failed
+        ? `重试加载附件 ${attachmentName}；当前图片加载失败。`
+        : "图片加载中，暂时不可点按"}
+    >
+      {failed ? (
+        <Icon name="photo" size={16} color={color.text} />
+      ) : (
+        <ActivityIndicator size="small" color={color.text} />
+      )}
+      <Text style={styles.userAttachmentLabel} numberOfLines={2}>
+        {failed
+          ? `图片加载失败：${state.error}\n点按重试`
+          : attachment.name || "正在加载图片…"}
+      </Text>
+    </Pressable>
+  );
+});
+
+/**
+ * memo 化:流式输出时列表每收到一个 delta 就重渲染,
+ * 不做记忆化的话历史消息(可能上百条)会跟着一起重算。
+ */
+const AssistantBubble = memo(function AssistantBubble({
+  item,
+  projectRoot,
+  onOpenFile,
+  loadProjectImage,
+  onSelectCopy,
+  showFiles = false,
+  reasoningExpanded = false,
+}: {
+  item: AssistantItem;
+  projectRoot?: string;
+  onOpenFile?: (reference: ProjectFileReference) => void;
+  loadProjectImage: ProjectImageLoader;
+  onSelectCopy: (source: string) => void;
+  showFiles?: boolean;
+  reasoningExpanded?: boolean;
+}) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const [showReasoning, setShowReasoning] = useState(false);
+  const copy = useCopy();
+  const cost = item.finish?.costUsd;
+  const input = item.finish?.inputTokens;
+  const out = item.finish?.outputTokens;
+  const finish = finishLabel(item.finish?.reason);
+  return (
+    <View style={styles.assistantRow}>
+      {item.reasoning.length > 0 && !reasoningExpanded && (
+        <Pressable
+          onPress={() => setShowReasoning((v) => !v)}
+          style={({ pressed }) => [styles.reasoningToggle, pressed && styles.inlinePressed]}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: showReasoning }}
+        >
+          <Text style={styles.reasoningToggleText}>
+            {showReasoning ? "▾ 收起思考" : "▸ 思考过程"}
+          </Text>
+        </Pressable>
+      )}
+      {(showReasoning || reasoningExpanded) && item.reasoning.length > 0 && <Text style={styles.reasoningText} selectable>{item.reasoning}</Text>}
+      {item.text.length > 0 && (
+        <Markdown
+          source={item.text}
+          projectRoot={projectRoot}
+          onOpenFile={onOpenFile}
+          loadProjectImage={loadProjectImage}
+        />
+      )}
+      {showFiles && projectRoot && <ResultFiles source={item.text} projectRoot={projectRoot} onOpenFile={onOpenFile} />}
+      {!item.done && item.text.length === 0 && item.reasoning.length === 0 && (
+        <View style={styles.thinkingRow}>
+          <View style={styles.thinkingDot} />
+          <Text style={styles.thinking}>正在思考</Text>
+        </View>
+      )}
+      {item.done && (finish !== null || cost !== undefined || input !== undefined || out !== undefined) && (
+        <Text style={styles.usage}>
+          {[
+            finish,
+            input !== undefined ? `输入 ${formatTokenCount(input)}` : null,
+            out !== undefined ? `输出 ${formatTokenCount(out)}` : null,
+            cost !== undefined && cost > 0 ? `$${cost.toFixed(4)}` : null,
+          ]
+            .filter((value): value is string => value !== null)
+            .join(" · ")}
+        </Text>
+      )}
+      {item.text.length > 0 && (
+        <>
+          <View style={styles.replyActions}>
+            <Pressable
+              style={({ pressed }) => [styles.copyReply, pressed && styles.inlinePressed]}
+              onPress={() => {
+                // 流式回复仍可能继续增长；打开时冻结一份，避免拖动选区时正文跳动。
+                onSelectCopy(item.text);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="选择回复中的一部分复制"
+            >
+              <Icon name="doc.on.doc" size={11} color={color.accent} />
+              <Text style={[styles.copyReplyText, styles.copySelectionText]}>选择复制</Text>
+            </Pressable>
+            <Pressable
+              style={({ pressed }) => [styles.copyReply, pressed && styles.inlinePressed]}
+              onPress={() => copy(item.text, "完整回复")}
+              accessibilityRole="button"
+              accessibilityLabel="复制完整回复"
+            >
+              <Text style={styles.copyReplyText}>复制全文</Text>
+            </Pressable>
+          </View>
+        </>
+      )}
+    </View>
+  );
+});
+
+const ResultFiles = memo(function ResultFiles({ source, projectRoot, onOpenFile }: {
+  source: string; projectRoot: string; onOpenFile?: (reference: ProjectFileReference) => void;
+}) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const files = useMemo(() => resultFiles(source, projectRoot), [source, projectRoot]);
+  if (!files.length) return null;
+  return <View style={styles.resultFiles}>
+    <Text style={styles.turnCapsuleText}>文件产出 · {files.length}</Text>
+    {files.map((file) => <Pressable key={file.path} accessibilityRole="link" accessibilityLabel={`打开文件产出 ${file.path}`}
+      disabled={!onOpenFile} onPress={() => onOpenFile?.(file)} style={styles.resultFile}>
+      <Icon name="doc.fill" size={15} color={color.accent} />
+      <Text style={styles.resultFileText} numberOfLines={1} ellipsizeMode="middle">{file.path}</Text>
+      <Icon name="chevron.right" size={11} color={color.textFaint} />
+    </Pressable>)}
+  </View>;
+});
+
+const stateLabel = { running: "运行中", success: "完成", failed: "失败" } as const;
+
+function formatTokenCount(value: number): string {
+  if (value < 1_000) return `${String(value)} tokens`;
+  if (value < 10_000) return `${(value / 1_000).toFixed(1)}k tokens`;
+  return `${Math.round(value / 1_000)}k tokens`;
+}
+
+function finishLabel(reason?: string): string | null {
+  if (!reason) return null;
+  const value = reason.toLowerCase();
+  if (["stop", "completed", "end_turn", "success"].includes(value)) return null;
+  if (value.includes("interrupt") || value.includes("cancel")) return "已中断";
+  if (value.includes("length") || value.includes("token")) return "达到输出上限";
+  if (value.includes("error") || value.includes("fail")) return "未完成";
+  return `结束：${reason}`;
+}
+
+const ToolCard = memo(function ToolCard({
+  item,
+  onFetchOutput,
+}: {
+  item: ToolItem;
+  onFetchOutput: (callId: string) => void;
+}) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const [expanded, setExpanded] = useState(false);
+  const copy = useCopy();
+
+  const toggle = (): void => {
+    const next = !expanded;
+    setExpanded(next);
+    // 展开时才去拉全文,避免把大量输出提前灌到手机上
+    if (next && item.hasMore === true && item.fullOutput === undefined) {
+      onFetchOutput(item.callId);
+    }
+  };
+
+  const body = item.fullOutput ?? item.result;
+  return (
+    <View style={styles.toolCard}>
+      <Pressable
+        onPress={toggle}
+        onLongPress={() => copy(`${item.tool}\n${item.input}\n${body ?? ""}`, "工具卡片")}
+        delayLongPress={350}
+        accessibilityRole="button"
+        accessibilityState={{ expanded }}
+        accessibilityHint="点按展开，长按复制"
+      >
+        <View style={styles.toolHeader}>
+          <View style={[styles.toolDot, { backgroundColor: { running: color.warn, success: color.success, failed: color.danger }[item.state] }]} />
+          <Text style={styles.toolName}>{item.tool}</Text>
+          {item.diff && (
+            <Text style={styles.diffBadge}>
+              +{item.diff.additions} −{item.diff.deletions}
+            </Text>
+          )}
+          <Text style={styles.toolState}>
+            {stateLabel[item.state]}
+            {body !== undefined && body.length > 0 ? (expanded ? " ▾" : " ▸") : ""}
+          </Text>
+        </View>
+        {item.input.length > 0 && (
+          <Text style={styles.toolInput} numberOfLines={expanded ? undefined : 2}>
+            {item.input}
+          </Text>
+        )}
+      </Pressable>
+      {item.diff && <DiffView diff={item.diff} />}
+      {expanded && body !== undefined && body.length > 0 && (
+        <ScrollView
+          horizontal
+          nestedScrollEnabled
+          showsHorizontalScrollIndicator={false}
+          style={styles.toolResultScroll}
+        >
+          <Text style={styles.toolResult} selectable>
+            {body}
+          </Text>
+        </ScrollView>
+      )}
+      {expanded && item.hasMore === true && item.fullOutput === undefined && (
+        <View style={styles.toolLoading}>
+          <ActivityIndicator size="small" color={color.textFaint} />
+          <Text style={styles.toolLoadingText}>正在拉取完整输出…</Text>
+        </View>
+      )}
+      {expanded && item.outputTruncated === true && (
+        <Text style={styles.toolTruncated}>完整输出因大小限制已截断</Text>
+      )}
+    </View>
+  );
+});
+
+const TurnDiffSummaryBar = memo(function TurnDiffSummaryBar({
+  item,
+  projectRoot,
+  onOpenFile,
+}: {
+  item: TurnDiffSummaryItem;
+  projectRoot?: string;
+  onOpenFile?: (reference: ProjectFileReference) => void;
+}) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const [expanded, setExpanded] = useState(false);
+  const [diffPath, setDiffPath] = useState<string | null>(null);
+  const files = useMemo(
+    () =>
+      item.files.map((file) => ({
+        ...file,
+        reference: projectRoot
+          ? resolveProjectFileReference(file.path, projectRoot, true)
+          : null,
+      })),
+    [item.files, projectRoot],
+  );
+  return (
+    <View style={styles.diffSummary}>
+      <Pressable
+        style={({ pressed }) => [styles.diffSummaryHeader, pressed && styles.inlinePressed]}
+        onPress={() => setExpanded((value) => !value)}
+        accessibilityRole="button"
+        accessibilityState={{ expanded }}
+        accessibilityLabel={`本轮改动 ${String(files.length)} 个文件，新增 ${String(item.additions)} 行，删除 ${String(item.deletions)} 行`}
+      >
+        <View style={styles.diffSummaryIcon}>
+          <Icon name="doc.on.doc" size={13} color={color.success} />
+        </View>
+        <Text style={styles.diffSummaryTitle}>本轮改动</Text>
+        <Text style={styles.diffSummaryFiles}>{String(files.length)} 个文件</Text>
+        <Text style={styles.diffSummaryAdd}>+{String(item.additions)}</Text>
+        <Text style={styles.diffSummaryDelete}>−{String(item.deletions)}</Text>
+        <Icon
+          name={expanded ? "chevron.down" : "chevron.right"}
+          size={11}
+          color={color.textFaint}
+        />
+      </Pressable>
+      {expanded && (
+        <View style={styles.diffSummaryList}>
+          {files.map((file) => {
+            const displayPath = file.reference?.path ?? file.path;
+            return (
+              <View key={file.path}>
+              <Pressable
+                style={({ pressed }) => [
+                  styles.diffSummaryRow,
+                  pressed && file.reference !== null && styles.inlinePressed,
+                ]}
+                disabled={!file.reference || !onOpenFile}
+                onPress={() => {
+                  if (file.reference) onOpenFile?.(file.reference);
+                }}
+                accessibilityRole={file.reference ? "link" : undefined}
+                accessibilityLabel={`预览 ${displayPath}`}
+              >
+                <Text style={styles.diffSummaryPath} numberOfLines={1} ellipsizeMode="middle">
+                  {displayPath}
+                </Text>
+                <Text style={styles.diffSummaryMiniAdd}>+{String(file.additions)}</Text>
+                <Text style={styles.diffSummaryMiniDelete}>−{String(file.deletions)}</Text>
+                {file.reference && <Icon name="chevron.right" size={10} color={color.textFaint} />}
+              </Pressable>
+              {file.diff && <Pressable accessibilityRole="button" accessibilityState={{ expanded: diffPath === file.path }}
+                accessibilityLabel={`查看 ${displayPath} 的改动`} style={styles.diffSummaryRow}
+                onPress={() => setDiffPath((previous) => previous === file.path ? null : file.path)}>
+                <Text style={styles.resultFileText}>{diffPath === file.path ? "收起改动" : "查看改动"}</Text>
+              </Pressable>}
+              {file.diff && diffPath === file.path && <DiffView diff={file.diff} />}
+              </View>
+            );
+          })}
+        </View>
+      )}
+    </View>
+  );
+});
+
+const replyLabel: Record<PermissionReply, string> = {
+  once: "已允许一次",
+  always: "已始终允许",
+  reject: "已拒绝",
+};
+
+const PermissionCard = memo(function PermissionCard({
+  item,
+  onRespond,
+}: {
+  item: PermissionItem;
+  onRespond: (reqId: string, reply: PermissionReply) => void;
+}) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const resolved = item.resolved;
+  // 自动批准的卡片刻意做得低调但可见:不该抢注意力(它没在等你),
+  // 但必须能在回滚聊天时一眼认出"这条没经过我"。
+  if (item.auto !== undefined) {
+    return (
+      <View style={styles.permAutoCard}>
+        <Text style={styles.permAutoText} numberOfLines={2}>
+          自动放行 · {item.summary || item.action}
+          {item.auto === "yolo" ? "(YOLO)" : ""}
+        </Text>
+      </View>
+    );
+  }
+  return (
+    <View style={[styles.permCard, resolved !== undefined && styles.permCardResolved]}>
+      <View style={styles.permHeader}>
+        <Icon name="exclamationmark.triangle.fill" size={18} color={color.warn} />
+        <View style={styles.permHeaderCopy}>
+          <Text style={styles.permKicker}>需要你的批准</Text>
+          <Text style={styles.permTitle}>{item.summary || item.action}</Text>
+        </View>
+      </View>
+      {item.summary && item.summary !== item.action && (
+        <Text style={styles.permAction}>{item.action}</Text>
+      )}
+      {item.diff ? (
+        <DiffView diff={item.diff} />
+      ) : (
+        item.resources.map((r, i) => (
+          <Text key={`${item.reqId}:${String(i)}`} style={styles.permResource} numberOfLines={4}>
+            {r}
+          </Text>
+        ))
+      )}
+      {resolved === undefined ? (
+        <View style={styles.permButtons}>
+          <View style={styles.permPrimaryRow}>
+            <Pressable
+              style={({ pressed }) => [
+                styles.permBtn,
+                styles.permReject,
+                pressed && styles.permBtnPressed,
+              ]}
+              onPress={() => onRespond(item.reqId, "reject")}
+              accessibilityRole="button"
+            >
+              <Text style={styles.permRejectText}>拒绝</Text>
+            </Pressable>
+            <Pressable
+              style={({ pressed }) => [
+                styles.permBtn,
+                styles.permAllow,
+                pressed && styles.permBtnPressed,
+              ]}
+              onPress={() => onRespond(item.reqId, "once")}
+              accessibilityRole="button"
+            >
+              <Text style={styles.permBtnText}>允许一次</Text>
+            </Pressable>
+          </View>
+          <Pressable
+            style={({ pressed }) => [styles.permAlways, pressed && styles.permBtnPressed]}
+            onPress={() => onRespond(item.reqId, "always")}
+            accessibilityRole="button"
+          >
+            <Text style={styles.permAlwaysText}>始终允许此类操作</Text>
+          </Pressable>
+        </View>
+      ) : (
+        <Text style={styles.permResolved}>{replyLabel[resolved]}</Text>
+      )}
+    </View>
+  );
+});
+
+const QuestionCard = memo(function QuestionCard({
+  item,
+  onRespond,
+}: {
+  item: QuestionItem;
+  onRespond: (reqId: string, answers: AgentQuestionAnswer[], cancelled?: boolean) => void;
+}) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const [selected, setSelected] = useState<Record<string, string[]>>({});
+  const [other, setOther] = useState<Record<string, string>>({});
+  const [visiblePreviews, setVisiblePreviews] = useState<Record<string, boolean>>({});
+  const resolved = item.answers !== undefined || item.cancelled === true;
+  const answers = item.questions.map((question): AgentQuestionAnswer => {
+    const values = [...(selected[question.id] ?? [])];
+    const custom = other[question.id]?.trim();
+    if (custom) values.push(custom);
+    return { questionId: question.id, values };
+  });
+  const ready = answers.every((answer) => answer.values.length > 0);
+
+  const toggle = (questionId: string, label: string, multi: boolean): void => {
+    setSelected((previous) => {
+      const values = previous[questionId] ?? [];
+      return {
+        ...previous,
+        [questionId]: multi
+          ? values.includes(label)
+            ? values.filter((value) => value !== label)
+            : [...values, label]
+          : [label],
+      };
+    });
+  };
+
+  return (
+    <View style={[styles.questionCard, resolved && styles.questionResolved]}>
+      <View style={styles.questionHeader}>
+        <Icon name="bubble.left.and.text.bubble.right" size={17} color={color.accent} />
+        <View style={styles.questionHeaderCopy}>
+          <Text style={styles.questionKicker}>Agent 需要你的回答</Text>
+          <Text style={styles.questionHint}>回答后会自动继续当前任务</Text>
+        </View>
+      </View>
+      {item.questions.map((question) => {
+        const resolvedAnswer = item.answers?.find((answer) => answer.questionId === question.id);
+        return (
+          <View key={question.id} style={styles.questionBlock}>
+            {question.header.length > 0 && <Text style={styles.questionTag}>{question.header}</Text>}
+            <Text style={styles.questionText}>{question.question}</Text>
+            {resolved ? (
+              <Text style={styles.questionAnswer} selectable>
+                {item.cancelled
+                  ? "已取消"
+                  : resolvedAnswer?.values.join("、") || "已回答"}
+              </Text>
+            ) : (
+              <>
+                <View style={styles.questionOptions}>
+                  {question.options.map((option) => {
+                    const active = (selected[question.id] ?? []).includes(option.label);
+                    const previewKey = `${question.id}\u0000${option.label}`;
+                    const showPreview = visiblePreviews[previewKey] === true;
+                    return (
+                      <View
+                        key={option.label}
+                        style={[
+                          styles.questionOption,
+                          active && styles.questionOptionActive,
+                        ]}
+                      >
+                        <Pressable
+                          style={({ pressed }) => [styles.questionOptionSelect, pressed && styles.inlinePressed]}
+                          onPress={() => toggle(question.id, option.label, question.multiSelect)}
+                          accessibilityRole={question.multiSelect ? "checkbox" : "radio"}
+                          accessibilityState={{ checked: active }}
+                        >
+                          <View style={[styles.questionChoice, active && styles.questionChoiceActive]} />
+                          <View style={styles.questionOptionCopy}>
+                            <Text style={[styles.questionOptionLabel, active && styles.questionOptionLabelActive]}>
+                              {option.label}
+                            </Text>
+                            {option.description && (
+                              <Text style={styles.questionOptionDescription}>{option.description}</Text>
+                            )}
+                          </View>
+                        </Pressable>
+                        {option.preview && (
+                          <Pressable
+                            style={({ pressed }) => [styles.questionPreviewToggle, pressed && styles.inlinePressed]}
+                            onPress={() =>
+                              setVisiblePreviews((previous) => ({
+                                ...previous,
+                                [previewKey]: !showPreview,
+                              }))
+                            }
+                            accessibilityRole="button"
+                            accessibilityState={{ expanded: showPreview }}
+                            accessibilityLabel={`${showPreview ? "收起" : "查看"}${option.label} 的预览`}
+                          >
+                            <Icon
+                              name={showPreview ? "chevron.down" : "chevron.right"}
+                              size={10}
+                              color={color.accent}
+                            />
+                            <Text style={styles.questionPreviewToggleText}>
+                              {showPreview ? "收起预览" : "查看预览"}
+                            </Text>
+                          </Pressable>
+                        )}
+                        {option.preview && showPreview && (
+                          <QuestionOptionPreview source={option.preview} />
+                        )}
+                      </View>
+                    );
+                  })}
+                </View>
+                {question.allowOther && (
+                  <TextInput
+                    style={styles.questionInput}
+                    value={other[question.id] ?? ""}
+                    onChangeText={(value) =>
+                      setOther((previous) => ({ ...previous, [question.id]: value }))
+                    }
+                    placeholder="其他答案…"
+                    placeholderTextColor={color.textFaint}
+                    secureTextEntry={question.secret === true}
+                    multiline={!question.secret}
+                  />
+                )}
+              </>
+            )}
+          </View>
+        );
+      })}
+      {!resolved && (
+        <View style={styles.questionActions}>
+          <Pressable
+            style={({ pressed }) => [styles.questionCancel, pressed && styles.inlinePressed]}
+            onPress={() => onRespond(item.reqId, [], true)}
+          >
+            <Text style={styles.questionCancelText}>取消</Text>
+          </Pressable>
+          <Pressable
+            style={({ pressed }) => [
+              styles.questionSubmit,
+              !ready && styles.questionSubmitDisabled,
+              pressed && ready && styles.inlinePressed,
+            ]}
+            disabled={!ready}
+            onPress={() => onRespond(item.reqId, answers)}
+          >
+            <Text style={styles.questionSubmitText}>提交回答</Text>
+          </Pressable>
+        </View>
+      )}
+    </View>
+  );
+});
+
+/** Claude 的问题选项可带 Markdown 或 HTML；HTML 在 RN 中转成安全的可读文本。 */
+const QuestionOptionPreview = memo(function QuestionOptionPreview({ source }: { source: string }) {
+  const styles = useStyles();
+  const markdown = useMemo(() => questionPreviewMarkdown(source), [source]);
+  return (
+    <View style={styles.questionPreview}>
+      <Markdown source={markdown} />
+    </View>
+  );
+});
+
+function questionPreviewMarkdown(source: string): string {
+  if (!/<\/?[a-z][^>]*>/i.test(source)) return source;
+  return source
+    .replace(/\r\n?/g, "\n")
+    .replace(/<(?:br|\/p|\/div|\/section|\/article|\/h[1-6]|\/li|\/tr|\/(?:td|th)|\/pre)\b[^>]*>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "- ")
+    .replace(/<[^>]*>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+const subagentStateLabel: Record<SubagentStatus, string> = {
+  starting: "启动中",
+  running: "工作中",
+  waiting_input: "等待回答",
+  idle: "可对话",
+  completed: "已完成",
+  failed: "失败",
+  stopped: "已停止",
+};
+
+const SubagentCard = memo(function SubagentCard({
+  item,
+  onOpen,
+}: {
+  item: SubagentItem;
+  onOpen?: (subagentId: string) => void;
+}) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const subagent = item.subagent;
+  const active = subagent.status === "running" || subagent.status === "starting";
+  return (
+    <Pressable
+      style={({ pressed }) => [styles.subagentCard, pressed && styles.inlinePressed]}
+      onPress={() => onOpen?.(subagent.id)}
+      disabled={!onOpen}
+      accessibilityRole="button"
+      accessibilityLabel={`查看子 Agent ${subagent.name}`}
+    >
+      <View style={styles.subagentCopy}>
+        <View style={styles.subagentTitleRow}>
+          <View style={[styles.subagentIdentity, active && styles.subagentIdentityActive]}>
+            <View
+              style={[
+                styles.subagentDot,
+                { backgroundColor: active ? color.accent : color.textFaint },
+              ]}
+            />
+            <Text style={styles.subagentName} numberOfLines={1}>{subagent.name}</Text>
+          </View>
+          {subagent.role && subagent.role !== subagent.name && (
+            <Text style={styles.subagentRole} numberOfLines={1}>{subagent.role}</Text>
+          )}
+          <View style={styles.subagentTitleSpacer} />
+          <Text style={[styles.subagentState, active && styles.subagentStateActive]}>
+            {subagentStateLabel[subagent.status]}
+          </Text>
+          <Icon name="chevron.right" size={12} color={color.textFaint} />
+        </View>
+        {(subagent.preview || subagent.task) && (
+          <Text style={styles.subagentPreview} numberOfLines={2}>
+            {subagent.preview || subagent.task}
+          </Text>
+        )}
+      </View>
+    </Pressable>
+  );
+});
+
+function durationLabel(milliseconds: number): string {
+  if (milliseconds < 1_000) return `${String(milliseconds)} ms`;
+  return `${(milliseconds / 1_000).toFixed(milliseconds < 10_000 ? 1 : 0)} s`;
+}
+
+const TrajectoryCard = memo(function TrajectoryCard({ item }: { item: TrajectoryItem }) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const [expanded, setExpanded] = useState(false);
+  const tint = item.phase === "failed"
+    ? color.danger
+    : item.phase === "running"
+      ? color.accent
+      : item.phase === "info"
+        ? color.warn
+        : color.success;
+  const icon = item.phase === "failed"
+    ? "exclamationmark.triangle.fill"
+    : item.phase === "running"
+      ? "arrow.clockwise"
+      : item.phase === "info"
+        ? "ellipsis.circle"
+        : "checkmark.circle.fill";
+  const metrics = [
+    item.durationMs !== undefined ? durationLabel(item.durationMs) : "",
+    item.inputTokens !== undefined ? `${String(item.inputTokens)} in` : "",
+    item.outputTokens !== undefined ? `${String(item.outputTokens)} out` : "",
+  ].filter(Boolean).join(" · ");
+
+  return (
+    <Pressable
+      style={({ pressed }) => [styles.trajectoryCard, pressed && styles.inlinePressed]}
+      onPress={() => item.detail && setExpanded((value) => !value)}
+      accessibilityRole={item.detail ? "button" : undefined}
+      accessibilityState={item.detail ? { expanded } : undefined}
+    >
+      <View style={[styles.trajectoryRail, { backgroundColor: tint }]} />
+      <View style={styles.trajectoryIcon}>
+        <Icon name={icon} size={15} color={tint} />
+      </View>
+      <View style={styles.trajectoryCopy}>
+        <View style={styles.trajectoryTitleRow}>
+          <Text style={styles.trajectoryTitle}>{item.title}</Text>
+          {metrics.length > 0 && <Text style={styles.trajectoryMetrics}>{metrics}</Text>}
+        </View>
+        {item.detail && (
+          <Text
+            style={styles.trajectoryDetail}
+            numberOfLines={expanded ? undefined : 2}
+            selectable={expanded}
+          >
+            {item.detail}
+          </Text>
+        )}
+      </View>
+      {item.detail && <Icon name={expanded ? "chevron.down" : "chevron.right"} size={11} color={color.textFaint} />}
+    </Pressable>
+  );
+});
+
+const ErrorCard = memo(function ErrorCard({
+  item,
+  onRetry,
+}: {
+  item: ErrorItem;
+  onRetry?: () => void;
+}) {
+  const styles = useStyles();
+  return (
+    <View style={styles.errorCard}>
+      <Text style={styles.errorText} selectable>
+        {item.message}
+      </Text>
+      {onRetry && (
+        <Pressable
+          onPress={onRetry}
+          hitSlop={6}
+          style={styles.retryBtn}
+          accessibilityRole="button"
+        >
+          <Text style={styles.retryText}>重发上一条</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+});
+
+const ActivityGroup = memo(function ActivityGroup({
+  item,
+  onFetchOutput,
+  onRespond,
+}: {
+  item: Extract<ChatDisplayItem, { type: "activity-group" }>;
+  onFetchOutput: (callId: string) => void;
+  onRespond: (reqId: string, reply: PermissionReply) => void;
+}) {
+  const styles = useStyles();
+  const { palette: color } = useMobileTheme();
+  const [expanded, setExpanded] = useState(false);
+  const tools = item.items.filter((entry): entry is ToolItem => entry.type === "tool");
+  const approvals = item.items.length - tools.length;
+  const names = [...new Set(tools.map((entry) => entry.tool))].slice(0, 3);
+  const additions = item.items.reduce((sum, entry) => sum + (entry.diff?.additions ?? 0), 0);
+  const deletions = item.items.reduce((sum, entry) => sum + (entry.diff?.deletions ?? 0), 0);
+  const details = [
+    names.join(" · "),
+    approvals > 0 ? `${String(approvals)} 次自动/已审批` : "",
+  ].filter(Boolean).join(" · ");
+
+  const renderActivity = (entry: FoldableActivityItem): React.ReactElement =>
+    entry.type === "tool" ? (
+      <ToolCard key={entry.key} item={entry} onFetchOutput={onFetchOutput} />
+    ) : (
+      <PermissionCard key={entry.key} item={entry} onRespond={onRespond} />
+    );
+
+  return (
+    <View style={styles.activityGroup}>
+      <Pressable
+        style={({ pressed }) => [styles.activityHeader, pressed && styles.inlinePressed]}
+        onPress={() => setExpanded((value) => !value)}
+        accessibilityRole="button"
+        accessibilityState={{ expanded }}
+        accessibilityLabel={`${expanded ? "收起" : "展开"}${String(item.items.length)} 项操作`}
+      >
+        <View style={styles.activityIcon}>
+          <Icon name="terminal" size={13} color={color.textDim} />
+        </View>
+        <View style={styles.activityCopy}>
+          <Text style={styles.activityTitle}>已完成 {String(item.items.length)} 项操作</Text>
+          {details.length > 0 && <Text style={styles.activityDetail} numberOfLines={1}>{details}</Text>}
+        </View>
+        {(additions > 0 || deletions > 0) && (
+          <Text style={styles.activityDiff}>+{String(additions)} −{String(deletions)}</Text>
+        )}
+        <Icon
+          name={expanded ? "chevron.down" : "chevron.right"}
+          size={12}
+          color={color.textFaint}
+        />
+      </Pressable>
+      {expanded && <View style={styles.activityItems}>{item.items.map(renderActivity)}</View>}
+    </View>
+  );
+});
+
+const useStyles = createThemedStyles((color) => StyleSheet.create({
+  turnCapsule: { alignSelf: "flex-start", flexDirection: "row", alignItems: "center", gap: 7,
+    minHeight: 40, paddingHorizontal: 13, paddingVertical: 8, borderRadius: 22, backgroundColor: color.surfaceRaised },
+  turnCapsuleText: { color: color.textDim, fontSize: 12, fontWeight: "600" },
+  turnCapsuleHint: { color: color.textFaint, fontSize: 11 },
+  resultFiles: { gap: 6, marginTop: 10 },
+  resultFile: { flexDirection: "row", alignItems: "center", gap: 8, minHeight: 42,
+    borderRadius: radius.md, backgroundColor: color.surfaceRaised, paddingHorizontal: 11 },
+  resultFileText: { flex: 1, color: color.accent, fontSize: 12 },
+  root: { flex: 1 },
+  list: { flex: 1, backgroundColor: color.bg },
+  content: {
+    flexGrow: 1,
+    width: "100%",
+    maxWidth: 920,
+    alignSelf: "center",
+    paddingHorizontal: 14,
+    // Inverted content: logical top is the visual bottom next to the composer.
+    paddingTop: 28,
+    paddingBottom: 14,
+    gap: 14,
+  },
+  empty: { minHeight: 280, alignItems: "center", justifyContent: "center", gap: 7 },
+  emptyIcon: {
+    width: 50,
+    height: 50,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: color.surface,
+    marginBottom: 4,
+  },
+  emptyTitle: { color: color.text, fontSize: 15, fontWeight: "600" },
+  emptyText: { color: color.textDim, fontSize: 13, textAlign: "center" },
+
+  agentWorking: {
+    minHeight: 42,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    paddingHorizontal: 2,
+    paddingTop: 10,
+  },
+  agentWorkingText: { fontSize: 12.5, fontWeight: "600" },
+  agentWorkingHint: { flex: 1, color: color.textFaint, fontSize: 10.5, textAlign: "right" },
+  agentStop: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 7,
+    paddingVertical: 5,
+    borderRadius: 7,
+    backgroundColor: color.dangerBg,
+  },
+  agentStopPressed: { opacity: 0.68 },
+  agentStopText: { color: color.danger, fontSize: 10, fontWeight: "600" },
+
+  jumpBtn: {
+    position: "absolute",
+    bottom: 14,
+    alignSelf: "center",
+    backgroundColor: color.text,
+    borderRadius: 18,
+    paddingHorizontal: 15,
+    paddingVertical: 8,
+    shadowColor: "#000",
+    shadowOpacity: 0.32,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+  },
+  jumpBtnPressed: { transform: [{ scale: 0.97 }] },
+  jumpText: { color: color.bg, fontSize: 12, fontWeight: "700" },
+
+  userRow: { alignItems: "flex-end" },
+  pendingOutgoingBubble: {
+    alignSelf: "flex-end",
+    maxWidth: "88%",
+    marginBottom: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderRadius: 15,
+    backgroundColor: color.accentDim,
+    opacity: 0.82,
+  },
+  pendingOutgoingText: { color: color.text, fontSize: 14, lineHeight: 20 },
+  pendingOutgoingStatus: { marginTop: 3, color: color.textDim, fontSize: 10 },
+  userBubble: {
+    backgroundColor: color.accent,
+    borderRadius: radius.lg,
+    borderBottomRightRadius: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    maxWidth: "86%",
+    gap: 8,
+  },
+  userText: { color: color.onAccent, fontSize: 15, lineHeight: 22 },
+  userAttachments: { flexDirection: "row", flexWrap: "wrap", gap: 7 },
+  userAttachmentImage: {
+    width: 168,
+    height: 126,
+    borderRadius: 8,
+    backgroundColor: color.accentDim,
+  },
+  userAttachmentPlaceholder: {
+    width: 168,
+    height: 92,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    backgroundColor: color.accentDim,
+  },
+  userAttachmentRetry: { borderWidth: 1, borderColor: color.text },
+  userAttachmentLabel: { color: color.text, fontSize: 10.5, lineHeight: 14, textAlign: "center" },
+
+  assistantRow: { gap: 7, paddingHorizontal: 2 },
+  thinkingRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 4 },
+  thinkingDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: color.accent },
+  thinking: { color: color.textDim, fontSize: 13 },
+  reasoningToggle: {
+    alignSelf: "flex-start",
+    backgroundColor: color.surface,
+    borderRadius: 9,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+  },
+  inlinePressed: { opacity: 0.72 },
+  reasoningToggleText: { color: color.accent, fontSize: 12, fontWeight: "500" },
+  reasoningText: {
+    color: color.textDim,
+    fontSize: 13,
+    lineHeight: 20,
+    borderLeftWidth: 2,
+    borderLeftColor: color.border,
+    paddingLeft: 10,
+  },
+  usage: { color: color.textFaint, fontSize: 11, fontVariant: ["tabular-nums"] },
+  replyActions: { flexDirection: "row", alignItems: "center", gap: 12 },
+  copyReply: {
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingVertical: 3,
+    paddingRight: 6,
+  },
+  copyReplyText: { color: color.textFaint, fontSize: 10.5 },
+  copySelectionText: { color: color.accent, fontWeight: "600" },
+  selectionHelp: { color: color.textDim, fontSize: 12, lineHeight: 18, marginBottom: 10 },
+  selectionInput: {
+    minHeight: 220,
+    maxHeight: 340,
+    padding: 12,
+    borderRadius: radius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: color.bg,
+    color: color.text,
+    fontSize: 15,
+    lineHeight: 22,
+    textAlignVertical: "top",
+  },
+  selectionActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingTop: 12,
+    paddingBottom: 4,
+  },
+  selectionPrimary: {
+    flex: 1,
+    minHeight: 42,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.md,
+    backgroundColor: color.accent,
+  },
+  selectionDisabled: { opacity: 0.42 },
+  selectionPrimaryText: { color: color.onAccent, fontSize: 13, fontWeight: "700" },
+  selectionSecondary: {
+    minHeight: 42,
+    paddingHorizontal: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.md,
+    backgroundColor: color.surfaceRaised,
+  },
+  selectionSecondaryText: { color: color.textDim, fontSize: 13, fontWeight: "600" },
+
+  toolCard: {
+    backgroundColor: color.surface,
+    borderRadius: radius.md,
+    padding: 11,
+    gap: 7,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+  },
+  toolHeader: { flexDirection: "row", alignItems: "center", gap: 8 },
+  toolDot: { width: 7, height: 7, borderRadius: 4 },
+  toolName: { color: color.text, fontSize: 13, fontWeight: "600", flex: 1 },
+  diffBadge: { color: color.success, fontSize: 11, fontVariant: ["tabular-nums"] },
+  toolState: { color: color.textFaint, fontSize: 11 },
+  toolInput: { color: color.textDim, fontSize: 12, fontFamily: MONOSPACE_FONT, lineHeight: 18 },
+  toolResultScroll: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.border,
+  },
+  toolResult: {
+    color: color.textDim,
+    fontSize: 12,
+    fontFamily: MONOSPACE_FONT,
+    lineHeight: 18,
+    minWidth: "100%",
+    paddingTop: 8,
+  },
+  toolLoading: { flexDirection: "row", alignItems: "center", gap: 7, paddingTop: 2 },
+  toolLoadingText: { color: color.textFaint, fontSize: 11 },
+  toolTruncated: { color: color.warn, fontSize: 10.5, paddingTop: 1 },
+
+  diffSummary: {
+    backgroundColor: color.surface,
+    borderRadius: radius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.success,
+    overflow: "hidden",
+  },
+  diffSummaryHeader: {
+    minHeight: 42,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  diffSummaryIcon: {
+    width: 25,
+    height: 25,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 7,
+    backgroundColor: color.successBg,
+  },
+  diffSummaryTitle: { color: color.text, fontSize: 12.5, fontWeight: "600" },
+  diffSummaryFiles: { flex: 1, color: color.textDim, fontSize: 10.5 },
+  diffSummaryAdd: { color: color.success, fontSize: 11, fontVariant: ["tabular-nums"] },
+  diffSummaryDelete: { color: color.danger, fontSize: 11, fontVariant: ["tabular-nums"] },
+  diffSummaryList: {
+    paddingHorizontal: 9,
+    paddingBottom: 8,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.border,
+  },
+  diffSummaryRow: {
+    minHeight: 34,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    paddingHorizontal: 4,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: color.border,
+  },
+  diffSummaryPath: {
+    flex: 1,
+    color: color.accent,
+    fontSize: 10.5,
+    fontFamily: MONOSPACE_FONT,
+  },
+  diffSummaryMiniAdd: { color: color.success, fontSize: 9.5 },
+  diffSummaryMiniDelete: { color: color.danger, fontSize: 9.5 },
+  diffSummaryMore: { color: color.textFaint, fontSize: 10, textAlign: "center", paddingTop: 7 },
+
+  activityGroup: {
+    backgroundColor: color.surface,
+    borderRadius: radius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    overflow: "hidden",
+  },
+  activityHeader: {
+    minHeight: 54,
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+  },
+  activityIcon: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    backgroundColor: color.surfaceRaised,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  activityCopy: { flex: 1, gap: 2 },
+  activityTitle: { color: color.text, fontSize: 13, fontWeight: "600" },
+  activityDetail: { color: color.textFaint, fontSize: 11 },
+  activityDiff: { color: color.success, fontSize: 11, fontVariant: ["tabular-nums"] },
+  activityItems: {
+    gap: 10,
+    paddingHorizontal: 10,
+    paddingBottom: 10,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: color.border,
+    paddingTop: 10,
+  },
+
+  permCard: {
+    backgroundColor: color.warnBg,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: color.warn,
+    padding: 13,
+    gap: 10,
+  },
+  permAutoCard: {
+    marginHorizontal: 8,
+    marginVertical: 2,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 8,
+    backgroundColor: color.surface,
+    borderLeftWidth: 2,
+    borderLeftColor: color.textFaint,
+  },
+  permAutoText: { color: color.textDim, fontSize: 11, lineHeight: 16 },
+  permCardResolved: { opacity: 0.58, borderColor: color.border },
+  permHeader: { flexDirection: "row", alignItems: "flex-start", gap: 10 },
+  permHeaderCopy: { flex: 1, gap: 2 },
+  permKicker: { color: color.warn, fontSize: 11, fontWeight: "700" },
+  permTitle: { color: color.text, fontSize: 14, fontWeight: "600", lineHeight: 20 },
+  permAction: { color: color.warn, fontSize: 12, fontFamily: MONOSPACE_FONT },
+  permResource: {
+    color: color.text,
+    fontSize: 12,
+    fontFamily: MONOSPACE_FONT,
+    backgroundColor: color.surface,
+    borderRadius: 8,
+    padding: 9,
+    lineHeight: 17,
+  },
+  permButtons: { gap: 8, marginTop: 2 },
+  permPrimaryRow: { flexDirection: "row", gap: 8 },
+  permBtn: { flex: 1, borderRadius: 9, paddingVertical: 11, alignItems: "center" },
+  permAllow: { backgroundColor: color.accent },
+  permReject: { backgroundColor: color.dangerBg },
+  permRejectText: { color: color.danger, fontSize: 13, fontWeight: "600" },
+  permAlways: {
+    borderRadius: 9,
+    paddingVertical: 10,
+    alignItems: "center",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.warn,
+  },
+  permAlwaysText: { color: color.warn, fontSize: 12, fontWeight: "500" },
+  permBtnPressed: { opacity: 0.72 },
+  permBtnText: { color: color.onAccent, fontSize: 13, fontWeight: "600" },
+  permResolved: { color: color.textDim, fontSize: 12, fontWeight: "500" },
+
+  questionCard: {
+    backgroundColor: color.surface,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: color.accentDim,
+    padding: 13,
+    gap: 12,
+  },
+  questionResolved: { opacity: 0.68, borderColor: color.border },
+  questionHeader: { flexDirection: "row", alignItems: "center", gap: 9 },
+  questionHeaderCopy: { flex: 1, gap: 1 },
+  questionKicker: { color: color.accent, fontSize: 11, fontWeight: "700" },
+  questionHint: { color: color.textFaint, fontSize: 10 },
+  questionBlock: { gap: 8 },
+  questionTag: { color: color.textDim, fontSize: 10, fontWeight: "600" },
+  questionText: { color: color.text, fontSize: 14, lineHeight: 20, fontWeight: "600" },
+  questionOptions: { gap: 7 },
+  questionOption: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    borderRadius: 9,
+    overflow: "hidden",
+  },
+  questionOptionActive: { borderColor: color.accent, backgroundColor: color.accentBg },
+  questionOptionSelect: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 9,
+    padding: 9,
+  },
+  questionChoice: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: color.textFaint,
+    marginTop: 2,
+  },
+  questionChoiceActive: { borderWidth: 4, borderColor: color.accent },
+  questionOptionCopy: { flex: 1, gap: 2 },
+  questionOptionLabel: { color: color.text, fontSize: 12.5, fontWeight: "500" },
+  questionOptionLabelActive: { color: color.text },
+  questionOptionDescription: { color: color.textDim, fontSize: 11, lineHeight: 16 },
+  questionPreviewToggle: {
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    marginLeft: 32,
+    marginTop: -3,
+    marginBottom: 8,
+    paddingVertical: 3,
+    paddingRight: 5,
+  },
+  questionPreviewToggleText: { color: color.accent, fontSize: 10.5, fontWeight: "600" },
+  questionPreview: {
+    marginHorizontal: 9,
+    marginBottom: 9,
+    padding: 9,
+    borderRadius: 7,
+    backgroundColor: color.bg,
+    borderLeftWidth: 2,
+    borderLeftColor: color.accentDim,
+  },
+  questionInput: {
+    minHeight: 38,
+    maxHeight: 100,
+    color: color.text,
+    backgroundColor: color.bg,
+    borderRadius: 9,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    fontSize: 12.5,
+  },
+  questionAnswer: {
+    color: color.success,
+    backgroundColor: color.successBg,
+    borderRadius: 8,
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+    fontSize: 12,
+  },
+  questionActions: { flexDirection: "row", justifyContent: "flex-end", gap: 8 },
+  questionCancel: { paddingHorizontal: 13, paddingVertical: 9 },
+  questionCancelText: { color: color.textDim, fontSize: 12, fontWeight: "600" },
+  questionSubmit: {
+    backgroundColor: color.accent,
+    borderRadius: 9,
+    paddingHorizontal: 15,
+    paddingVertical: 9,
+  },
+  questionSubmitDisabled: { opacity: 0.38 },
+  questionSubmitText: { color: color.onAccent, fontSize: 12, fontWeight: "700" },
+
+  subagentCard: {
+    minHeight: 62,
+    backgroundColor: color.surface,
+    borderRadius: radius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  subagentDot: { width: 8, height: 8, borderRadius: 4 },
+  subagentCopy: { flex: 1, gap: 4 },
+  subagentTitleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  subagentIdentity: {
+    maxWidth: "58%",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: color.surfaceRaised,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+  },
+  subagentIdentityActive: { borderColor: color.accent, backgroundColor: color.accentBg },
+  subagentName: { flexShrink: 1, color: color.text, fontSize: 12, fontWeight: "700" },
+  subagentRole: { maxWidth: "25%", color: color.textFaint, fontSize: 10 },
+  subagentTitleSpacer: { flex: 1 },
+  subagentState: { color: color.textFaint, fontSize: 10 },
+  subagentStateActive: { color: color.accent },
+  subagentPreview: { color: color.textDim, fontSize: 11, lineHeight: 16 },
+
+  trajectoryCard: {
+    minHeight: 50,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+    borderRadius: radius.md,
+    backgroundColor: color.surface,
+    paddingRight: 11,
+    overflow: "hidden",
+  },
+  trajectoryRail: { alignSelf: "stretch", width: 3 },
+  trajectoryIcon: { width: 22, alignItems: "center", justifyContent: "center" },
+  trajectoryCopy: { flex: 1, gap: 4, paddingVertical: 9 },
+  trajectoryTitleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  trajectoryTitle: { flex: 1, color: color.text, fontSize: 12.5, fontWeight: "700" },
+  trajectoryMetrics: { color: color.textFaint, fontSize: 9.5, fontFamily: MONOSPACE_FONT },
+  trajectoryDetail: { color: color.textDim, fontSize: 11, lineHeight: 16 },
+
+  errorCard: { backgroundColor: color.dangerBg, borderRadius: radius.md, padding: 11, gap: 7 },
+  errorText: { color: color.danger, fontSize: 13, lineHeight: 19 },
+  retryBtn: { alignSelf: "flex-start" },
+  retryText: { color: color.accent, fontSize: 12, fontWeight: "600" },
+}));

@@ -1,0 +1,5 @@
+[bindings.kotlin]
+package_name = "uniffi.obryth_mobile"
+cdylib_name = "obryth_mobile"
+[bindings.swift]
+ffi_module_name = "obryth_mobileFFI"

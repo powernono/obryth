@@ -1,0 +1,27 @@
+{
+  "name": "obryth",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "dev": "pnpm --filter @obryth/desktop dev",
+    "desktop": "bash scripts/desktop.sh dev",
+    "build": "pnpm --filter @obryth/desktop build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r --if-present test",
+    "test:rust": "bash scripts/cargo.sh test --workspace --exclude obryth-desktop",
+    "cli": "bash scripts/cargo.sh run -p obryth-cli --",
+    "contracts": "bash scripts/cargo.sh run -p obryth-core --bin export-contracts",
+    "prospero:build": "bash scripts/build-prospero.sh",
+    "mobile": "pnpm --filter @obryth/mobile start",
+    "desktop:build": "bash scripts/desktop.sh build",
+    "mobile:bindings": "bash scripts/mobile-bindings.sh",
+    "smoke": "python3 scripts/smoke.py --prospero apps/desktop/src-tauri/binaries/prosperod-rs",
+    "format": "prettier --write apps/desktop/src apps/desktop/e2e apps/mobile/App.tsx apps/mobile/src packages extensions",
+    "protocol:build": "pnpm --filter @prospero/protocol build"
+  },
+  "devDependencies": {
+    "prettier": "^3.8.0",
+    "typescript": "5.9.3"
+  }
+}

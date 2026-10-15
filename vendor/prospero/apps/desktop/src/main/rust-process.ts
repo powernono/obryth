@@ -1,0 +1,222 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
+import { constants, openSync, closeSync, fstatSync, readFileSync } from "node:fs";
+import { delimiter, dirname, isAbsolute, resolve } from "node:path";
+import { RustClient } from "./rust-client";
+
+export type RustConnection = {
+  client: RustClient;
+  pid: number;
+  baseUrl: string;
+  buildId?: string;
+  expectedBuildId?: string;
+  upgradeDeferred?: boolean;
+  upgradeBlocked?: boolean;
+};
+
+async function exitedWithin(exited: Promise<void>, milliseconds: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try { return await Promise.race([exited.then(() => true), new Promise<false>(done => { timer = setTimeout(() => done(false), milliseconds); })]); }
+  finally { clearTimeout(timer); }
+}
+
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+export class RustProcess {
+  private child: ChildProcess | undefined;
+  private exited: Promise<void> = Promise.resolve();
+  private starting: Promise<RustConnection> | undefined;
+  private stopping: Promise<void> | undefined;
+  private startup: AbortController | undefined;
+  private connection: RustConnection | undefined;
+  private readonly expectedBuildId: string | undefined;
+
+  constructor(
+    readonly binary: string,
+    readonly directory: string,
+    private readonly onExit: () => void = () => {},
+    private readonly env?: Record<string, string>,
+  ) {
+    if (!isAbsolute(binary) || !isAbsolute(directory)) throw new Error("Rust runtime paths must be absolute");
+    try { this.expectedBuildId = createHash("sha256").update(readFileSync(binary)).digest("hex"); } catch { this.expectedBuildId = undefined; }
+  }
+
+  get managed(): boolean { return Boolean(this.child && this.child.exitCode === null && this.child.signalCode === null); }
+  get upgradePending(): boolean { return this.connection?.upgradeDeferred === true && this.connection.upgradeBlocked !== true; }
+
+  async attach(timeoutMs = 2500): Promise<RustConnection | undefined> {
+    if (this.connection && this.managed) return this.connection;
+    let connection: RustConnection;
+    try {
+      connection = this.readConnectionFile();
+    } catch {
+      return undefined;
+    }
+    try {
+      const health = await connection.client.health(AbortSignal.timeout(timeoutMs));
+      if (health.apiVersion !== 1 || health.backend !== "rust") return undefined;
+      if (!this.expectedBuildId || health.buildId === this.expectedBuildId) return this.accept(connection, health.buildId);
+      if (health.activeRuntimeSessions !== 0) return this.accept(connection, health.buildId, true);
+      try { await connection.client.shutdown(AbortSignal.timeout(700), health.buildId); } catch { return this.accept(connection, health.buildId, true, true); }
+      return await this.waitForReplacement(connection.pid, Math.max(timeoutMs, 20_000));
+    } catch {
+      // A live daemon whose HTTP shell responds but whose runtime/database
+      // worker is unavailable cannot be attached and still owns the data-dir
+      // lock. Ask that authenticated process to retire, then wait for the lock
+      // owner to exit before launch() starts a replacement.
+      await connection.client.shutdown(AbortSignal.timeout(700)).catch(() => {});
+      await this.waitForPidExit(connection.pid, Math.max(timeoutMs, 5_000));
+      return undefined;
+    }
+  }
+
+  private async waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try { process.kill(pid, 0); } catch { return true; }
+      await delay(100);
+    }
+    return false;
+  }
+
+  start(): Promise<RustConnection> {
+    if (this.stopping) return this.stopping.then(() => this.start());
+    if (this.connection && this.managed) return Promise.resolve(this.connection);
+    if (!this.starting) this.starting = this.launch().finally(() => { this.starting = undefined; });
+    return this.starting;
+  }
+
+  private async launch(): Promise<RustConnection> {
+    const startup = new AbortController();
+    this.startup = startup;
+    const binaryDir = dirname(this.binary);
+    const suppliedPath = this.env?.PATH ?? process.env.PATH ?? "";
+    const childEnv = {
+      ...process.env,
+      ...(this.env ?? {}),
+      PATH: suppliedPath.split(delimiter).includes(binaryDir) ? suppliedPath : [binaryDir, suppliedPath].filter(Boolean).join(delimiter),
+    };
+    const child = spawn(this.binary, ["serve", "--data-dir", this.directory], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: childEnv });
+    this.child = child;
+    child.on("error", () => {});
+    this.exited = new Promise(done => child.once("close", () => {
+      if (this.child === child) { this.child = undefined; this.connection = undefined; this.onExit(); }
+      done();
+    }));
+    child.stderr?.resume();
+    const timer = setTimeout(() => startup.abort(), 120000);
+    try {
+      const ready = await new Promise<{ pid: number; baseUrl: string }>((done, fail) => {
+        let output = "";
+        const cleanup = (): void => { child.stdout?.off("data", data); child.off("error", error); child.off("exit", exit); startup.signal.removeEventListener("abort", abort); };
+        const reject = (message: string): void => { cleanup(); fail(new Error(message)); };
+        const error = (): void => reject("Rust 服务启动失败，请检查二进制与数据目录");
+        const exit = (): void => reject("Rust 服务在就绪前退出");
+        const abort = (): void => reject("Rust 服务启动已取消或超时");
+        const data = (chunk: Buffer): void => {
+          output += chunk.toString("utf8");
+          if (Buffer.byteLength(output) > 16384) { reject("Rust startup output exceeds limit"); return; }
+          const newline = output.indexOf("\n");
+          if (newline < 0) return;
+          try {
+            const value = JSON.parse(output.slice(0, newline)) as Record<string, unknown>;
+            if (value["event"] !== "ready" || value["apiVersion"] !== 1 || value["pid"] !== child.pid || typeof value["baseUrl"] !== "string") throw new Error();
+            cleanup(); child.stdout?.resume(); done({ pid: Number(value["pid"]), baseUrl: value["baseUrl"] });
+          } catch { reject("Invalid Rust readiness response"); }
+        };
+        child.stdout?.on("data", data);
+        child.once("error", error); child.once("exit", exit);
+        startup.signal.addEventListener("abort", abort, { once: true });
+      });
+      const connection = this.readConnectionFile(ready);
+      const client = connection.client;
+      const health = await client.health(startup.signal);
+      if (health.apiVersion !== 1 || health.backend !== "rust" || (this.expectedBuildId && health.buildId !== this.expectedBuildId) || startup.signal.aborted || !this.managed) throw new Error("Rust health check failed");
+      this.connection = { ...connection, buildId: health.buildId, ...(this.expectedBuildId ? { expectedBuildId: this.expectedBuildId } : {}) };
+      return this.connection;
+    } catch (error) {
+      await this.stop();
+      throw error;
+    } finally { clearTimeout(timer); if (this.startup === startup) this.startup = undefined; }
+  }
+
+  private readConnectionFile(expected?: { pid: number; baseUrl: string }): RustConnection {
+    const descriptor = openSync(resolve(this.directory, "connection.json"), constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW));
+    let value: Record<string, unknown>;
+    try {
+      const stat = fstatSync(descriptor);
+      if (!stat.isFile() || stat.size > 4096 || stat.nlink !== 1 || (process.platform !== "win32" && ((stat.mode & 0o077) !== 0 || stat.uid !== process.getuid?.()))) throw new Error("Invalid Rust connection file");
+      value = JSON.parse(readFileSync(descriptor, "utf8")) as Record<string, unknown>;
+    } finally { closeSync(descriptor); }
+    const pid = value["pid"];
+    const baseUrl = value["baseUrl"];
+    const token = value["token"];
+    if (value["apiVersion"] !== 1 || !Number.isInteger(pid) || typeof baseUrl !== "string" || typeof token !== "string") throw new Error("Invalid Rust connection file");
+    if (expected && (pid !== expected.pid || baseUrl !== expected.baseUrl)) throw new Error("Rust connection does not match the owned process");
+    try { process.kill(Number(pid), 0); } catch { throw new Error("Rust daemon is not running"); }
+    return { client: new RustClient(baseUrl, token), pid: Number(pid), baseUrl };
+  }
+
+  private accept(connection: RustConnection, buildId: string | undefined, upgradeDeferred = false, upgradeBlocked = false): RustConnection {
+    const base: RustConnection = { client: connection.client, pid: connection.pid, baseUrl: connection.baseUrl };
+    this.connection = {
+      ...base,
+      ...(buildId ? { buildId } : {}),
+      ...(this.expectedBuildId ? { expectedBuildId: this.expectedBuildId } : {}),
+      ...(upgradeDeferred ? { upgradeDeferred: true } : {}),
+      ...(upgradeBlocked ? { upgradeBlocked: true } : {}),
+    };
+    return this.connection;
+  }
+
+  private async waitForReplacement(previousPid: number, timeoutMs: number): Promise<RustConnection | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await delay(100);
+      try {
+        const connection = this.readConnectionFile();
+        const health = await connection.client.health(AbortSignal.timeout(1000));
+        if (health.apiVersion !== 1 || health.backend !== "rust") continue;
+        if (health.buildId === this.expectedBuildId) return this.accept(connection, health.buildId);
+        if (connection.pid !== previousPid) return this.accept(connection, health.buildId, true, true);
+      } catch {}
+    }
+    this.connection = undefined;
+    return undefined;
+  }
+
+  async completeDeferredUpgrade(timeoutMs = 20_000): Promise<RustConnection | undefined> {
+    const connection = this.connection;
+    if (!connection?.upgradeDeferred || !this.expectedBuildId) return connection;
+    try {
+      const health = await connection.client.health(AbortSignal.timeout(1000));
+      if (health.buildId === this.expectedBuildId) return this.accept(connection, health.buildId);
+      if (health.activeRuntimeSessions !== 0) return connection;
+      await connection.client.shutdown(AbortSignal.timeout(700), health.buildId);
+      return await this.waitForReplacement(connection.pid, timeoutMs);
+    } catch {
+      return connection;
+    }
+  }
+
+  stop(): Promise<void> {
+    if (!this.stopping) this.stopping = this.terminate().finally(() => { this.stopping = undefined; });
+    return this.stopping;
+  }
+
+  private async terminate(): Promise<void> {
+    this.startup?.abort();
+    const child = this.child;
+    if (!child) return;
+    const exited = this.exited;
+    const force = setTimeout(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }, 1800);
+    try {
+      if (this.connection) await this.connection.client.shutdown(AbortSignal.timeout(700)).catch(() => {});
+      if (await exitedWithin(exited, 700)) return;
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      if (!(await exitedWithin(exited, 1800))) throw new Error("Rust 服务未在关闭期限内退出");
+    } finally { clearTimeout(force); }
+  }
+}

@@ -1,0 +1,57 @@
+body {
+  width: 290px;
+  padding: 20px;
+  margin: 0;
+  font:
+    13px -apple-system,
+    system-ui;
+  color: #3e5038;
+  background: #f7f9f4;
+}
+.brand {
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.8px;
+  color: #537447;
+  margin-bottom: 24px;
+}
+h2 {
+  font-size: 17px;
+  font-weight: 550;
+}
+p,
+small {
+  font-size: 11px;
+  color: #96a18a;
+  line-height: 1.8;
+}
+strong {
+  display: block;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  margin: 22px 0 13px;
+}
+button {
+  width: 100%;
+  border: 0;
+  border-radius: 8px;
+  padding: 12px;
+  background: #7e9e6b;
+  color: white;
+  cursor: pointer;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+#status {
+  font-size: 11px;
+  color: #7b8c6f;
+  margin: 15px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+small {
+  display: block;
+  font-size: 10px;
+}

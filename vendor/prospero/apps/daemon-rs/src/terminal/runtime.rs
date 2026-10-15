@@ -1,0 +1,1492 @@
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use tokio::sync::Semaphore;
+
+use super::handle::Handle;
+use super::*;
+use crate::protocol::{SessionHead, SessionStatus, UpdateSession};
+use crate::worker::Database;
+
+const NATIVE_CODEX_ID: &str = "native-codex";
+
+struct State {
+    guard: Option<PathBuf>,
+    guard_hash: Option<String>,
+    database: Database,
+    entries: Mutex<HashMap<String, Handle>>,
+    slots: Arc<Semaphore>,
+    closed: AtomicBool,
+    failed: AtomicBool,
+    changed: watch::Sender<u64>,
+    checkpoints: Arc<Semaphore>,
+    control_environment: std::sync::Mutex<Option<crate::control_cli::ControlEnvironment>>,
+}
+
+#[derive(Clone)]
+pub struct Terminals(Arc<State>);
+
+/// Explicit program for a non-shell PTY (managed-account login flow).
+#[derive(Debug, Clone)]
+pub(crate) struct ProgramSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    pub environment: Vec<(String, String)>,
+    pub account_id: Option<String>,
+}
+
+impl Terminals {
+    pub fn new(database: Database) -> Self {
+        Self::with_guard(database, None, None)
+    }
+
+    pub(crate) fn with_guard(
+        database: Database,
+        guard: Option<PathBuf>,
+        guard_hash: Option<String>,
+    ) -> Self {
+        Self(Arc::new(State {
+            guard,
+            guard_hash,
+            database,
+            entries: Mutex::new(HashMap::new()),
+            slots: Arc::new(Semaphore::new(16)),
+            closed: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            changed: watch::channel(0).0,
+            checkpoints: Arc::new(Semaphore::new(2)),
+            control_environment: std::sync::Mutex::new(None),
+        }))
+    }
+
+    pub fn detached(&self) -> bool {
+        self.0.guard.is_some()
+    }
+
+    pub fn count(&self) -> usize {
+        16 - self.0.slots.available_permits()
+    }
+
+    /// Spawns the managed-Claude login flow (`claude setup-token`) in a PTY
+    /// rooted at the account's isolated config directory. The returned head is
+    /// a normal pty session; its run is bound to the account for accounting.
+    pub async fn create_login(
+        &self,
+        account_id: &str,
+        title: String,
+        size: TerminalSize,
+        environment: Vec<(String, String)>,
+    ) -> Result<SessionHead> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| Error::Invalid("无法定位用户目录".into()))?;
+        let program = std::env::var("PROSPERO_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+        let input = CreateTerminal {
+            title,
+            workspace: home.to_string_lossy().into_owned(),
+            size,
+            agent: Some(crate::protocol::AgentKind::Claude),
+            command: None,
+            account_id: None,
+            model: None,
+            effort: None,
+            approval_policy: None,
+        };
+        let spec = ProgramSpec {
+            program,
+            args: vec!["setup-token".into()],
+            environment,
+            account_id: Some(account_id.to_owned()),
+        };
+        self.create_with(input, Some(spec)).await
+    }
+
+    pub(crate) fn changes(&self) -> watch::Sender<u64> {
+        self.0.changed.clone()
+    }
+
+    pub fn configure_control_environment(
+        &self,
+        base_url: String,
+        token_path: PathBuf,
+        socket_path: String,
+        cli_dir: Option<PathBuf>,
+    ) {
+        if let Ok(mut environment) = self.0.control_environment.lock() {
+            *environment = Some(crate::control_cli::ControlEnvironment {
+                home: self.0.database.directory().to_owned(),
+                base_url,
+                token_path,
+                socket_path,
+                cli_dir,
+            });
+        }
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.closed() || self.failed() {
+            Err(Error::Closed)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn closed(&self) -> bool {
+        self.0.closed.load(Ordering::Acquire)
+    }
+
+    pub fn failed(&self) -> bool {
+        self.0.failed.load(Ordering::Acquire)
+    }
+
+    pub async fn create(&self, mut input: CreateTerminal) -> Result<SessionHead> {
+        let spec = self.pty_program_for(&mut input).await?;
+        self.create_with(input, spec).await
+    }
+
+    /// A non-shell PTY (the managed-account login flow): runs an explicit
+    /// program with private environment overrides and is bound to the account
+    /// for active-session accounting.
+    pub(crate) async fn create_with(
+        &self,
+        input: CreateTerminal,
+        spec: Option<ProgramSpec>,
+    ) -> Result<SessionHead> {
+        validate_size(input.size)?;
+        crate::database::validate_text(&input.title, 512, false)?;
+        crate::database::validate_text(&input.workspace, 4096, false)?;
+        if !Path::new(&input.workspace).is_absolute() {
+            return Err(Error::Invalid("workspace must be absolute".into()));
+        }
+        if self.0.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        let permit = self.0.slots.clone().try_acquire_owned().map_err(|_| {
+            self.0
+                .database
+                .record_rejection("terminal.create", "terminal_sessions");
+            Error::Backpressure(crate::error::ResourceBackpressure {
+                retry_after_ms: 1000,
+                operation: "terminal.create".into(),
+                resource: "terminal_sessions".into(),
+                queue_depth: self.count(),
+                queue_capacity: 16,
+                side_effect_committed: Some(false),
+            })
+        })?;
+        let runtime = self.clone();
+        let (reply, result) = oneshot::channel();
+        tokio::spawn(async move {
+            let created = if reply.is_closed() {
+                Err(Error::Closed)
+            } else {
+                runtime.start(input, spec).await
+            };
+            match created {
+                Ok((head, terminal)) => {
+                    if reply.send(Ok(head.clone())).is_err()
+                        || runtime.0.closed.load(Ordering::Acquire)
+                    {
+                        let _ = terminal.stop().await;
+                    }
+                    runtime.track(head, terminal, permit).await;
+                    return;
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            }
+            drop(permit);
+            runtime
+                .0
+                .changed
+                .send_modify(|seq| *seq = seq.wrapping_add(1));
+        });
+        result.await.map_err(|_| Error::Closed)?
+    }
+
+    async fn track(
+        &self,
+        head: SessionHead,
+        terminal: Handle,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let runtime = self.clone();
+        let activity_runtime = runtime.clone();
+        let activity_id = head.id.clone();
+        let activity_terminal = terminal.clone();
+        let activity_task = tokio::spawn(async move {
+            if let Err(error) = activity_runtime
+                .persist_activity(&activity_id, &activity_terminal)
+                .await
+            {
+                eprintln!("terminal activity sync failed: {error}");
+            }
+        });
+        let persistence = runtime.persist_live(&head.id, &terminal).await;
+        if terminal.lost() {
+            activity_task.abort();
+            match runtime.fail(&head.id).await {
+                Ok(()) => {
+                    if let Ok(mut entries) = runtime.0.entries.lock() {
+                        entries.remove(&head.id);
+                    }
+                }
+                Err(_) => runtime.0.failed.store(true, Ordering::Release),
+            }
+            drop(permit);
+            runtime
+                .0
+                .changed
+                .send_modify(|seq| *seq = seq.wrapping_add(1));
+            return;
+        }
+        if persistence.is_err() {
+            runtime.0.failed.store(true, Ordering::Release);
+            runtime.0.closed.store(true, Ordering::Release);
+            let _ = terminal.stop().await;
+            terminal.wait_exited().await;
+            eprintln!("terminal checkpoint failed");
+        }
+        activity_task.abort();
+        if terminal.hosted()
+            && runtime.0.closed.load(Ordering::Acquire)
+            && !runtime.0.failed.load(Ordering::Acquire)
+        {
+            if let Ok(mut entries) = runtime.0.entries.lock() {
+                entries.remove(&head.id);
+            }
+            drop(permit);
+            runtime
+                .0
+                .changed
+                .send_modify(|seq| *seq = seq.wrapping_add(1));
+            return;
+        }
+        let finalized = runtime.finish_handle(&head.id, &terminal).await;
+        if finalized.is_ok() {
+            let _ = terminal.release().await;
+        }
+        if finalized.is_err() {
+            runtime.0.failed.store(true, Ordering::Release);
+            runtime.0.closed.store(true, Ordering::Release);
+            eprintln!("terminal finalization failed");
+        }
+        if !runtime.0.failed.load(Ordering::Acquire)
+            && let Ok(mut entries) = runtime.0.entries.lock()
+        {
+            entries.remove(&head.id);
+        }
+        drop(permit);
+        runtime
+            .0
+            .changed
+            .send_modify(|seq| *seq = seq.wrapping_add(1));
+    }
+
+    pub async fn recover(&self) -> Result<usize> {
+        let ids = self
+            .0
+            .database
+            .call(|store| store.active_terminal_ids())
+            .await?;
+        let mut retained = Vec::new();
+        if self.0.guard.is_some() {
+            for id in &ids {
+                let directory = self.0.database.directory().join("terminal-hosts").join(id);
+                match host::Host::attach(directory.clone()).await {
+                    Ok(host) => {
+                        let permit = self
+                            .0
+                            .slots
+                            .clone()
+                            .try_acquire_owned()
+                            .map_err(|_| Error::Busy)?;
+                        let session_id = id.clone();
+                        let head = self
+                            .0
+                            .database
+                            .call(move |store| {
+                                let head = store.session(&session_id)?;
+                                store.update_session(
+                                    &session_id,
+                                    UpdateSession {
+                                        revision: head.revision,
+                                        title: None,
+                                        lifecycle: None,
+                                        status: Some(SessionStatus::Running),
+                                    },
+                                )
+                            })
+                            .await?;
+                        let terminal = Handle::Hosted(host);
+                        self.0
+                            .entries
+                            .lock()
+                            .map_err(|_| Error::Closed)?
+                            .insert(id.clone(), terminal.clone());
+                        retained.push(id.clone());
+                        let runtime = self.clone();
+                        tokio::spawn(async move {
+                            runtime.track(head, terminal, permit).await;
+                        });
+                    }
+                    Err(_) => {
+                        // An owned but temporarily unreachable host must not be
+                        // declared dead or replaced by a second shell.
+                        if host::owner_alive(&directory)? {
+                            return Err(Error::Closed);
+                        }
+                    }
+                }
+            }
+        }
+        let count = retained.len();
+        self.0
+            .database
+            .call(move |store| store.recover_terminals_except(&retained))
+            .await?;
+        host::reap_exited(self.0.database.directory().join("terminal-hosts"), &ids).await?;
+        Ok(count)
+    }
+
+    async fn stopping(&self) {
+        let mut changed = self.0.changed.subscribe();
+        while !self.0.closed.load(Ordering::Acquire) {
+            if changed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn finish(&self, id: &str, archive: Archive) -> Result<()> {
+        let mut delay = Duration::from_millis(25);
+        loop {
+            let id = id.to_owned();
+            let archive = archive.clone();
+            match self
+                .0
+                .database
+                .call_control("terminal.finish", move |store| {
+                    store.finish_terminal(&id, archive)
+                })
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if retryable_database_pressure(&error) => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(500));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn checkpoint_cursor(&self, id: &str) -> Result<i64> {
+        let mut delay = Duration::from_millis(25);
+        loop {
+            let id = id.to_owned();
+            match self
+                .0
+                .database
+                .call_control("terminal.checkpoint.cursor", move |store| {
+                    store.terminal_checkpoint_seq(&id)
+                })
+                .await
+            {
+                Ok(seq) => return Ok(seq),
+                Err(error) if retryable_database_pressure(&error) => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(500));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn finish_handle(&self, id: &str, terminal: &Handle) -> Result<()> {
+        let mut seq = self.checkpoint_cursor(id).await?;
+        loop {
+            let archive = match terminal.checkpoint(Some(seq)).await? {
+                Some(archive) => archive,
+                None => {
+                    let page = terminal
+                        .read(TerminalQuery {
+                            after_seq: Some(seq),
+                            wait_ms: Some(0),
+                        })
+                        .await?;
+                    if !page.exited || page.latest_seq != seq || page.resync_required {
+                        return Err(Error::Conflict);
+                    }
+                    Archive {
+                        snapshot: terminal.snapshot().await?,
+                        floor: page.floor_seq,
+                        start: seq,
+                        seq,
+                        latest_seq: seq,
+                        events: Vec::new(),
+                        exit_code: page.exit_code,
+                    }
+                }
+            };
+            if archive.latest_seq <= archive.seq {
+                return self.finish(id, archive).await;
+            }
+            if archive.seq <= seq {
+                return Err(Error::Conflict);
+            }
+            let next = archive.seq;
+            let mut delay = Duration::from_millis(25);
+            loop {
+                let id = id.to_owned();
+                let archive = archive.clone();
+                match self
+                    .0
+                    .database
+                    .call_control("terminal.checkpoint", move |store| {
+                        store.checkpoint_terminal(&id, archive)
+                    })
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(error) if retryable_database_pressure(&error) => {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_millis(500));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            seq = next;
+        }
+    }
+
+    async fn fail(&self, id: &str) -> Result<()> {
+        let mut delay = Duration::from_millis(25);
+        loop {
+            let id = id.to_owned();
+            match self
+                .0
+                .database
+                .call_control("terminal.fail", move |store| store.fail_terminal(&id))
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if retryable_database_pressure(&error) => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(500));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn persist_activity(&self, id: &str, terminal: &Handle) -> Result<()> {
+        let mut published: Option<Option<i64>> = None;
+        loop {
+            if terminal.hosted() && self.0.closed.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let activity = terminal.activity().await?;
+            if published != Some(activity.busy_since) {
+                let id = id.to_owned();
+                let busy_since = activity.busy_since;
+                match self
+                    .0
+                    .database
+                    .call_background("terminal.activity", move |store| {
+                        store.set_session_busy_since(&id, busy_since)
+                    })
+                    .await
+                {
+                    Ok(true) => self.0.changed.send_modify(|seq| *seq = seq.wrapping_add(1)),
+                    Ok(false) => {}
+                    Err(Error::NotFound) if activity.exited => return Ok(()),
+                    Err(error) if retryable_database_pressure(&error) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+                published = Some(activity.busy_since);
+            }
+            if activity.exited {
+                return Ok(());
+            }
+            let timeout = activity
+                .last_activity_at
+                .map(|last| {
+                    let now = crate::database::now();
+                    Duration::from_millis(
+                        last.saturating_add(super::ACTIVITY_IDLE_MS)
+                            .saturating_sub(now)
+                            .max(1) as u64,
+                    )
+                })
+                .unwrap_or_else(|| Duration::from_secs(60));
+            terminal.wait_activity(activity.version, timeout).await;
+        }
+    }
+
+    async fn persist_live(&self, id: &str, terminal: &Handle) -> Result<()> {
+        let mut seq = self.checkpoint_cursor(id).await?;
+        let mut catching_up = false;
+        let mut replay_warning = false;
+        loop {
+            if !catching_up {
+                tokio::select! {
+                    _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                    _ = terminal.wait_exited() => return Ok(()),
+                    _ = terminal.wait_output(seq) => {},
+                }
+                tokio::select! {
+                    _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                    _ = terminal.wait_exited() => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+                }
+            }
+            let permit = tokio::select! {
+                _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                _ = terminal.wait_exited() => return Ok(()),
+                permit = self.0.checkpoints.clone().acquire_owned() => permit.map_err(|_| Error::Closed)?,
+            };
+            let archive = tokio::select! {
+                _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                archive = terminal.checkpoint(Some(seq)) => archive,
+            };
+            drop(permit);
+            let archive = match archive {
+                Ok(archive) => archive,
+                Err(Error::Feature(code, _)) if code == "terminal_replay_unavailable" => {
+                    if !replay_warning {
+                        eprintln!(
+                            "terminal replay journal is unavailable; preserving the live terminal"
+                        );
+                        replay_warning = true;
+                    }
+                    catching_up = true;
+                    tokio::select! {
+                        _ = self.stopping(), if terminal.hosted() => return Ok(()),
+                        _ = terminal.wait_exited() => return Ok(()),
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let Some(archive) = archive else {
+                catching_up = false;
+                continue;
+            };
+            let next = archive.seq;
+            if next <= seq {
+                return Err(Error::Conflict);
+            }
+            let more = archive.latest_seq > next;
+            let id = id.to_owned();
+            match self
+                .0
+                .database
+                .call_background("terminal.checkpoint", move |store| {
+                    store.checkpoint_terminal(&id, archive)
+                })
+                .await
+            {
+                Ok(()) => {
+                    seq = next;
+                    catching_up = more;
+                    self.0
+                        .changed
+                        .send_modify(|value| *value = value.wrapping_add(1));
+                }
+                Err(error) if retryable_database_pressure(&error) => {
+                    catching_up = true;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn start(
+        &self,
+        mut input: CreateTerminal,
+        spec: Option<ProgramSpec>,
+    ) -> Result<(SessionHead, Handle)> {
+        let workspace = input.workspace.clone();
+        let directory = tokio::task::spawn_blocking(move || std::fs::canonicalize(workspace))
+            .await
+            .map_err(|_| Error::Closed)??;
+        if !directory.is_dir() {
+            return Err(Error::Invalid("workspace is not a directory".into()));
+        }
+        input.workspace = directory
+            .to_str()
+            .ok_or_else(|| Error::Invalid("workspace must be Unicode".into()))?
+            .into();
+        if self.0.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        let size = input.size;
+        let executable = self.0.guard.clone();
+        let expected_hash = self.0.guard_hash.clone();
+        let host_directory = self.0.database.directory().join("terminal-hosts");
+        let account_id = spec.as_ref().and_then(|spec| spec.account_id.clone());
+        let control_environment = self
+            .0
+            .control_environment
+            .lock()
+            .ok()
+            .and_then(|environment| environment.clone());
+        let head = self
+            .0
+            .database
+            .call(move |store| store.create_terminal_with(input, account_id))
+            .await?;
+        let session_id = head.id.clone();
+        let host_directory = host_directory.join(&head.id);
+        let command = tokio::task::spawn_blocking(move || {
+            let mut command = match &spec {
+                Some(spec) => {
+                    // Explicit program (managed-account login): no shell, no
+                    // guard, private env overrides only.
+                    let mut command = portable_pty::CommandBuilder::new(&spec.program);
+                    command.args(&spec.args);
+                    for (key, value) in &spec.environment {
+                        command.env(key, value);
+                    }
+                    command
+                }
+                None => {
+                    let shell = login_shell(default_shell());
+                    login_shell_command(shell)
+                }
+            };
+            command.cwd(directory);
+            command.env("TERM", "xterm-256color");
+            command.env("COLORTERM", "truecolor");
+            command.env("CLICOLOR", "1");
+            command.env("TERM_PROGRAM", "Prospero");
+            command.env_remove("NO_COLOR");
+            if command
+                .get_env("FORCE_COLOR")
+                .is_some_and(|value| value == "0")
+            {
+                command.env_remove("FORCE_COLOR");
+            }
+            if command.get_env("LANG").is_none() {
+                command.env("LANG", "en_US.UTF-8");
+            }
+            if let Some(control) = control_environment {
+                for (key, value) in control.vars(Some(&session_id)) {
+                    command.env(key, value);
+                }
+            }
+            for key in ["TMUX", "TMUX_PANE", "STY"] {
+                command.env_remove(key);
+            }
+            command
+        })
+        .await
+        .map_err(|_| Error::Closed)?;
+        let child = match executable {
+            Some(exe) => host::Host::start(
+                exe,
+                host_directory,
+                command,
+                size,
+                expected_hash.unwrap_or_default(),
+            )
+            .await
+            .map(Handle::Hosted),
+            None => tokio::task::spawn_blocking(move || spawn(command, size))
+                .await
+                .map_err(|_| Error::Closed)?
+                .map(Handle::Local),
+        };
+        let terminal = match child {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let id = head.id;
+                self.finish(
+                    &id,
+                    Archive {
+                        snapshot: None,
+                        floor: 0,
+                        start: 0,
+                        seq: 0,
+                        latest_seq: 0,
+                        events: Vec::new(),
+                        exit_code: None,
+                    },
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        let id = head.id.clone();
+        let running = self
+            .0
+            .database
+            .call(move |store| {
+                let head = store.session(&id)?;
+                store.update_session(
+                    &id,
+                    UpdateSession {
+                        revision: head.revision,
+                        title: None,
+                        lifecycle: None,
+                        status: Some(SessionStatus::Running),
+                    },
+                )
+            })
+            .await;
+        if let Err(error) = running {
+            let _ = terminal.stop().await;
+            terminal.wait_exited().await;
+            let id = head.id;
+            self.finish_handle(&id, &terminal).await?;
+            return Err(error);
+        }
+        self.0
+            .entries
+            .lock()
+            .map_err(|_| Error::Closed)?
+            .insert(head.id.clone(), terminal.clone());
+        Ok((running?, terminal))
+    }
+
+    fn terminal(&self, id: &str) -> Result<Handle> {
+        crate::database::validate_id(id)?;
+        self.0
+            .entries
+            .lock()
+            .map_err(|_| Error::Closed)?
+            .get(id)
+            .cloned()
+            .ok_or(Error::NotFound)
+    }
+
+    pub async fn read(&self, id: String, query: TerminalQuery) -> Result<TerminalPage> {
+        match self.terminal(&id) {
+            Ok(terminal) => terminal.read(query).await,
+            Err(Error::NotFound) => {
+                self.0
+                    .database
+                    .call(move |store| store.terminal_output(&id, query))
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn snapshot(&self, id: String) -> Result<Option<TerminalSnapshot>> {
+        match self.terminal(&id) {
+            Ok(terminal) => terminal.snapshot().await,
+            Err(Error::NotFound) => {
+                self.0
+                    .database
+                    .call(move |store| store.terminal_snapshot(&id))
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn input(&self, id: &str, input: TerminalInput) -> Result<()> {
+        self.terminal(id)?.input(input).await
+    }
+    pub async fn resize(&self, id: &str, size: TerminalSize) -> Result<()> {
+        self.terminal(id)?.resize(size).await
+    }
+    pub(crate) fn host(&self, id: &str) -> Result<Option<super::host::Host>> {
+        Ok(self.terminal(id)?.host())
+    }
+    pub(crate) fn local(&self, id: &str) -> Result<Option<Terminal>> {
+        Ok(self.terminal(id)?.local())
+    }
+    pub async fn close(&self, id: &str) -> Result<()> {
+        self.terminal(id)?.stop().await
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.0.closed.store(true, Ordering::Release);
+        self.0.changed.send_modify(|seq| *seq = seq.wrapping_add(1));
+        let terminals: Vec<_> = self
+            .0
+            .entries
+            .lock()
+            .map_err(|_| Error::Closed)?
+            .values()
+            .cloned()
+            .collect();
+        for terminal in terminals {
+            if !terminal.hosted() {
+                terminal.stop().await?;
+            }
+        }
+        let mut changed = self.0.changed.subscribe();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                changed.borrow_and_update();
+                if self.count() == 0 {
+                    return;
+                }
+                if changed.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await
+        .map_err(|_| Error::Timeout)?;
+        if self.failed() {
+            Err(Error::Closed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn shell_command(command: &str) -> Result<ProgramSpec> {
+    if command.len() > 2000 || command.contains('\0') || command.trim().is_empty() {
+        return Err(Error::Invalid("invalid terminal command".into()));
+    }
+    let shell = login_shell(default_shell());
+    let shell = shell
+        .into_string()
+        .map_err(|_| Error::Invalid("shell path must be Unicode".into()))?;
+    #[cfg(windows)]
+    let args = if is_windows_powershell(&shell) {
+        vec![
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            command.to_owned(),
+        ]
+    } else {
+        vec!["/d".into(), "/s".into(), "/c".into(), command.to_owned()]
+    };
+    #[cfg(not(windows))]
+    let args = vec!["-c".into(), command.to_owned()];
+    Ok(ProgramSpec {
+        program: shell,
+        args,
+        environment: Vec::new(),
+        account_id: None,
+    })
+}
+
+fn retryable_database_pressure(error: &Error) -> bool {
+    match error {
+        Error::Busy => true,
+        Error::Backpressure(pressure) => pressure.resource.starts_with("database."),
+        _ => false,
+    }
+}
+
+fn normalize_selection(
+    value: Option<&String>,
+    maximum: usize,
+    message: &'static str,
+) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.chars().count() > maximum || value.chars().any(|c| c.is_control()) {
+        return Err(Error::Invalid(message.into()));
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::Invalid(message.into()));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn push_env(env: &mut Vec<(String, String)>, key: &str, value: impl Into<String>) {
+    env.retain(|(existing, _)| existing != key);
+    env.push((key.into(), value.into()));
+}
+
+fn claude_binary() -> String {
+    std::env::var("PROSPERO_CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
+}
+
+fn codex_binary() -> String {
+    std::env::var("PROSPERO_CODEX_BIN").unwrap_or_else(|_| "codex".into())
+}
+
+impl Terminals {
+    async fn pty_program_for(&self, input: &mut CreateTerminal) -> Result<Option<ProgramSpec>> {
+        let policy = input.approval_policy.unwrap_or_default();
+        input.approval_policy = Some(policy);
+        let Some(agent) = input.agent else {
+            if input.account_id.is_some() || input.model.is_some() || input.effort.is_some() {
+                return Err(Error::Invalid(
+                    "terminal launch selection is invalid".into(),
+                ));
+            }
+            return Ok(None);
+        };
+        let model = normalize_selection(input.model.as_ref(), 160, "模型无效")?;
+        let effort = normalize_selection(input.effort.as_ref(), 80, "思考强度无效")?;
+        if effort.is_some() && model.is_none() && agent != crate::protocol::AgentKind::Codex {
+            return Err(Error::Invalid("推理强度必须和启动模型一起指定".into()));
+        }
+        match (agent, input.command.as_deref()) {
+            (crate::protocol::AgentKind::Shell, None) => {
+                if input.account_id.is_some() || model.is_some() || effort.is_some() {
+                    return Err(Error::Invalid(
+                        "terminal launch selection is invalid".into(),
+                    ));
+                }
+                Ok(None)
+            }
+            (
+                crate::protocol::AgentKind::Shell | crate::protocol::AgentKind::Custom,
+                Some(command),
+            ) => {
+                if input.account_id.is_some() || model.is_some() || effort.is_some() {
+                    return Err(Error::Invalid(
+                        "custom terminal launch selection is invalid".into(),
+                    ));
+                }
+                Ok(Some(shell_command(command)?))
+            }
+            (crate::protocol::AgentKind::Custom, None) => {
+                Err(Error::Invalid("custom agent requires a command".into()))
+            }
+            (_, Some(command)) => {
+                if input.account_id.is_some() || model.is_some() || effort.is_some() {
+                    return Err(Error::Invalid(
+                        "custom terminal launch selection is invalid".into(),
+                    ));
+                }
+                Ok(Some(shell_command(command)?))
+            }
+            (crate::protocol::AgentKind::Claude, None) => {
+                let (mut environment, account_id, default_model, default_effort) = self
+                    .resolve_claude_terminal_account(input.account_id.clone())
+                    .await?;
+                let effective_model = model.or(default_model);
+                let effective_effort = if input.effort.is_some() {
+                    effort
+                } else {
+                    default_effort
+                };
+                input.model = effective_model.clone();
+                input.effort = effective_effort.clone();
+                if let Some(model) = effective_model {
+                    push_env(&mut environment, "ANTHROPIC_MODEL", model);
+                }
+                if let Some(effort) = effective_effort {
+                    push_env(&mut environment, "CLAUDE_CODE_EFFORT_LEVEL", effort);
+                }
+                Ok(Some(ProgramSpec {
+                    program: claude_binary(),
+                    args: match policy {
+                        crate::protocol::TerminalApprovalPolicy::Strict => {
+                            vec!["--permission-mode".into(), "default".into()]
+                        }
+                        crate::protocol::TerminalApprovalPolicy::Standard => {
+                            vec!["--permission-mode".into(), "acceptEdits".into()]
+                        }
+                        crate::protocol::TerminalApprovalPolicy::Yolo => {
+                            vec!["--dangerously-skip-permissions".into()]
+                        }
+                    },
+                    environment,
+                    account_id,
+                }))
+            }
+            (crate::protocol::AgentKind::Codex, None) => {
+                let (environment, account_id, profile) = self
+                    .resolve_codex_terminal_account(input.account_id.clone())
+                    .await?;
+                let mut effective_model = model.clone();
+                let mut effective_effort = effort.clone();
+                if let Some((_, home)) = environment.iter().find(|(key, _)| key == "CODEX_HOME") {
+                    let config_path = PathBuf::from(home).join("config.toml");
+                    let defaults = tokio::task::spawn_blocking(move || {
+                        let source = std::fs::read_to_string(config_path).ok()?;
+                        let config = toml::from_str::<toml::Value>(&source).ok()?;
+                        let selected = config
+                            .get("profile")
+                            .and_then(toml::Value::as_str)
+                            .and_then(|name| config.get("profiles")?.get(name));
+                        let value = |key: &str| {
+                            selected
+                                .and_then(|table| table.get(key))
+                                .or_else(|| config.get(key))
+                                .and_then(toml::Value::as_str)
+                                .map(str::to_owned)
+                        };
+                        Some((value("model"), value("model_reasoning_effort")))
+                    })
+                    .await
+                    .map_err(|_| Error::Closed)?;
+                    if let Some((default_model, default_effort)) = defaults {
+                        effective_model = effective_model.or(default_model);
+                        effective_effort = effective_effort.or(default_effort);
+                    }
+                }
+                input.model = effective_model.clone();
+                input.effort = effective_effort.clone();
+                let mut args = match policy {
+                    crate::protocol::TerminalApprovalPolicy::Strict => vec![
+                        "--ask-for-approval".into(),
+                        "untrusted".into(),
+                        "--sandbox".into(),
+                        "read-only".into(),
+                    ],
+                    crate::protocol::TerminalApprovalPolicy::Standard => vec![
+                        "--ask-for-approval".into(),
+                        "on-request".into(),
+                        "--sandbox".into(),
+                        "workspace-write".into(),
+                    ],
+                    crate::protocol::TerminalApprovalPolicy::Yolo => {
+                        vec!["--dangerously-bypass-approvals-and-sandbox".into()]
+                    }
+                };
+                args.extend([
+                    "-c".into(),
+                    format!(
+                        "developer_instructions={}",
+                        serde_json::to_string(
+                            crate::cross_model_tool::CODEX_DEVELOPER_INSTRUCTIONS
+                        )?
+                    ),
+                ]);
+                if let Some(profile) = profile.as_ref() {
+                    if profile.protocol() != "openai_responses" {
+                        return Err(Error::Invalid(
+                            "Codex PTY 仅支持 OpenAI Responses Profile".into(),
+                        ));
+                    }
+                    args.extend(crate::accounts::profile::codex_app_server_args(profile));
+                    input.model = Some(profile.model.clone());
+                }
+                if let Some(model) = effective_model {
+                    input.model = Some(model.clone());
+                    args.extend([
+                        "-c".into(),
+                        format!("model={}", serde_json::to_string(&model)?),
+                    ]);
+                }
+                if let Some(effort) = effective_effort {
+                    input.effort = Some(effort.clone());
+                    args.extend([
+                        "-c".into(),
+                        format!("model_reasoning_effort={}", serde_json::to_string(&effort)?),
+                    ]);
+                }
+                Ok(Some(ProgramSpec {
+                    program: codex_binary(),
+                    args,
+                    environment,
+                    account_id,
+                }))
+            }
+            (crate::protocol::AgentKind::Opencode, None) => {
+                if input.account_id.is_some() || model.is_some() || effort.is_some() {
+                    return Err(Error::Invalid(
+                        "terminal launch selection is invalid".into(),
+                    ));
+                }
+                Ok(Some(ProgramSpec {
+                    program: "opencode".into(),
+                    args: Vec::new(),
+                    environment: Vec::new(),
+                    account_id: None,
+                }))
+            }
+            (crate::protocol::AgentKind::Grok, None) => {
+                if input.account_id.is_some() || model.is_some() || effort.is_some() {
+                    return Err(Error::Invalid(
+                        "terminal launch selection is invalid".into(),
+                    ));
+                }
+                Ok(Some(ProgramSpec {
+                    program: "grok".into(),
+                    args: Vec::new(),
+                    environment: Vec::new(),
+                    account_id: None,
+                }))
+            }
+            (crate::protocol::AgentKind::Trae, None) => {
+                if input.account_id.is_some() || model.is_some() || effort.is_some() {
+                    return Err(Error::Invalid(
+                        "terminal launch selection is invalid".into(),
+                    ));
+                }
+                Ok(Some(ProgramSpec {
+                    program: "trae-cli".into(),
+                    args: vec!["interactive".into()],
+                    environment: Vec::new(),
+                    account_id: None,
+                }))
+            }
+            (crate::protocol::AgentKind::Deepseek, None) => Err(Error::Invalid(
+                "DeepSeek Harness only supports structured sessions".into(),
+            )),
+        }
+    }
+
+    async fn resolve_claude_terminal_account(
+        &self,
+        account_id: Option<String>,
+    ) -> Result<(
+        Vec<(String, String)>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
+        let Some(id) = account_id else {
+            return Ok((Vec::new(), None, None, None));
+        };
+        if id == crate::accounts::NATIVE_CLAUDE_ID {
+            return Ok((Vec::new(), None, None, None));
+        }
+        crate::database::validate_id(&id)?;
+        let data = self.0.database.directory().to_owned();
+        let record = self
+            .0
+            .database
+            .call({
+                let database = self.0.database.clone();
+                let data = data.clone();
+                let id = id.clone();
+                move |store| {
+                    if let Some(message) =
+                        crate::accounts::source_bound_launch_error(&database, &id)?
+                    {
+                        return Err(Error::Invalid(message));
+                    }
+                    let record = store.managed_snapshot_row(&data, &id)?;
+                    let target = crate::accounts::config::ConfigTarget {
+                        account_id: record.id.clone(),
+                        model: record
+                            .api_profile
+                            .as_ref()
+                            .map(|profile| profile.model.clone()),
+                        model_capabilities: record
+                            .api_profile
+                            .as_ref()
+                            .and_then(|profile| profile.model_capabilities.clone()),
+                        active_sessions: 0,
+                    };
+                    let (default_model, default_effort) =
+                        crate::accounts::config::read_defaults(&data, &target)?;
+                    let defaults = (target.model.or(default_model), default_effort);
+                    Ok((record, defaults))
+                }
+            })
+            .await?;
+        let (record, (default_model, default_effort)) = record;
+        let account_id = record.id.clone();
+        let env_id = account_id.clone();
+        let agent = record.agent;
+        let env = tokio::task::spawn_blocking(move || match record.api_profile {
+            Some(profile) => crate::accounts::managed::profile_account_environment(
+                &data, &env_id, agent, &profile,
+            ),
+            None => crate::accounts::managed::claude_environment(&data, &env_id, false),
+        })
+        .await
+        .map_err(|_| Error::Closed)??;
+        Ok((env, Some(account_id), default_model, default_effort))
+    }
+
+    async fn resolve_codex_terminal_account(
+        &self,
+        account_id: Option<String>,
+    ) -> Result<(
+        Vec<(String, String)>,
+        Option<String>,
+        Option<crate::accounts::ApiProfile>,
+    )> {
+        match account_id.as_deref() {
+            None => Ok((Vec::new(), None, None)),
+            Some(NATIVE_CODEX_ID) => {
+                let data = self.0.database.directory().to_owned();
+                let env = tokio::task::spawn_blocking(move || {
+                    crate::agent::native_codex_terminal_environment(&data)
+                })
+                .await
+                .map_err(|_| Error::Closed)??;
+                Ok((env, Some(NATIVE_CODEX_ID.into()), None))
+            }
+            Some(account_id) => {
+                let data = self.0.database.directory().to_owned();
+                let id = account_id.to_owned();
+                let record = self
+                    .0
+                    .database
+                    .call({
+                        let data = data.clone();
+                        let id = id.clone();
+                        move |store| store.managed_snapshot_row(&data, &id)
+                    })
+                    .await?;
+                let profile = record
+                    .api_profile
+                    .ok_or_else(|| Error::Invalid("所选账号不支持 Codex PTY".into()))?;
+                if profile.protocol() != "openai_responses" {
+                    return Err(Error::Invalid(
+                        "Codex PTY 仅支持 OpenAI Responses Profile".into(),
+                    ));
+                }
+                if record.agent != crate::protocol::AgentKind::Codex {
+                    return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
+                }
+                let env_id = record.id.clone();
+                let env_profile = profile.clone();
+                let agent = record.agent;
+                let env = tokio::task::spawn_blocking(move || {
+                    crate::accounts::managed::profile_account_environment(
+                        &data,
+                        &env_id,
+                        agent,
+                        &env_profile,
+                    )
+                })
+                .await
+                .map_err(|_| Error::Closed)??;
+                Ok((env, Some(record.id), Some(profile)))
+            }
+        }
+    }
+}
+
+fn login_shell(shell: Option<OsString>) -> OsString {
+    #[cfg(windows)]
+    {
+        let shell = shell
+            .or_else(|| std::env::var_os("COMSPEC"))
+            .or_else(|| std::env::var_os("ComSpec"));
+        let Some(shell) = shell else {
+            return "cmd.exe".into();
+        };
+        let value = shell.to_string_lossy();
+        if value.contains('\0') || value.trim().is_empty() {
+            return "cmd.exe".into();
+        }
+        return shell;
+    }
+    #[cfg(not(windows))]
+    {
+        let Some(shell) = shell else {
+            return "/bin/sh".into();
+        };
+        let path = Path::new(&shell);
+        if !path.is_absolute() {
+            return "/bin/sh".into();
+        }
+        let allowed = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "csh" | "tcsh"
+                )
+            });
+        if allowed { shell } else { "/bin/sh".into() }
+    }
+}
+
+fn default_shell() -> Option<OsString> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("COMSPEC")
+            .or_else(|| std::env::var_os("ComSpec"))
+            .or_else(|| std::env::var_os("SHELL"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("SHELL")
+    }
+}
+
+fn login_shell_command(shell: OsString) -> portable_pty::CommandBuilder {
+    let mut command = portable_pty::CommandBuilder::new(shell.clone());
+    #[cfg(windows)]
+    {
+        let shell = shell.to_string_lossy();
+        if is_windows_powershell(&shell) {
+            command.arg("-NoLogo");
+        } else {
+            command.arg("/d");
+        }
+    }
+    #[cfg(not(windows))]
+    command.arg("-l");
+    command
+}
+
+#[cfg(windows)]
+fn is_windows_powershell(shell: &str) -> bool {
+    let name = Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "powershell.exe" | "pwsh.exe" | "powershell" | "pwsh"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_shell, login_shell};
+    use std::ffi::OsString;
+
+    #[tokio::test]
+    async fn approval_policies_control_agent_launch_arguments() {
+        use crate::protocol::{AgentKind, TerminalApprovalPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let database = crate::worker::Database::open(directory.path().into())
+            .await
+            .unwrap();
+        let runtime = super::Terminals::new(database.clone());
+        for (agent, policy, expected) in [
+            (
+                AgentKind::Claude,
+                TerminalApprovalPolicy::Strict,
+                vec!["--permission-mode", "default"],
+            ),
+            (
+                AgentKind::Claude,
+                TerminalApprovalPolicy::Standard,
+                vec!["--permission-mode", "acceptEdits"],
+            ),
+            (
+                AgentKind::Claude,
+                TerminalApprovalPolicy::Yolo,
+                vec!["--dangerously-skip-permissions"],
+            ),
+            (
+                AgentKind::Codex,
+                TerminalApprovalPolicy::Strict,
+                vec!["--ask-for-approval", "untrusted", "--sandbox", "read-only"],
+            ),
+            (
+                AgentKind::Codex,
+                TerminalApprovalPolicy::Standard,
+                vec![
+                    "--ask-for-approval",
+                    "on-request",
+                    "--sandbox",
+                    "workspace-write",
+                ],
+            ),
+            (
+                AgentKind::Codex,
+                TerminalApprovalPolicy::Yolo,
+                vec!["--dangerously-bypass-approvals-and-sandbox"],
+            ),
+        ] {
+            let mut input = super::CreateTerminal {
+                title: "policy".into(),
+                workspace: directory.path().to_string_lossy().into_owned(),
+                size: super::TerminalSize { cols: 80, rows: 24 },
+                agent: Some(agent),
+                command: None,
+                account_id: None,
+                model: None,
+                effort: None,
+                approval_policy: Some(policy),
+            };
+            let spec = runtime.pty_program_for(&mut input).await.unwrap().unwrap();
+            assert_eq!(&spec.args[..expected.len()], expected.as_slice());
+            assert_eq!(input.approval_policy, Some(policy));
+        }
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_codex_effort_uses_cli_default_model() {
+        use crate::protocol::{AgentKind, TerminalApprovalPolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let source_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source_home.path().join("config.toml"),
+            "model_reasoning_effort = 'high'\n",
+        )
+        .unwrap();
+        let previous = std::env::var_os("CODEX_HOME");
+        unsafe { std::env::set_var("CODEX_HOME", source_home.path()) };
+        let database = crate::worker::Database::open(directory.path().into())
+            .await
+            .unwrap();
+        let runtime = super::Terminals::new(database.clone());
+        let mut input = super::CreateTerminal {
+            title: "native default".into(),
+            workspace: directory.path().to_string_lossy().into_owned(),
+            size: super::TerminalSize { cols: 80, rows: 24 },
+            agent: Some(AgentKind::Codex),
+            command: None,
+            account_id: Some("native-codex".into()),
+            model: None,
+            effort: Some("high".into()),
+            approval_policy: Some(TerminalApprovalPolicy::Standard),
+        };
+        let spec = runtime.pty_program_for(&mut input).await.unwrap().unwrap();
+        assert!(!spec.args.iter().any(|arg| arg == "model=\""));
+        assert!(
+            spec.args
+                .iter()
+                .any(|arg| arg == "model_reasoning_effort=\"high\"")
+        );
+        assert_eq!(input.model, None);
+        assert_eq!(input.effort.as_deref(), Some("high"));
+        database.shutdown().await.unwrap();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn login_shell_rejects_non_shell() {
+        assert_eq!(
+            login_shell(Some(OsString::from("/bin/cat"))),
+            OsString::from("/bin/sh")
+        );
+    }
+
+    #[test]
+    fn login_shell_rejects_relative_path() {
+        assert_eq!(
+            login_shell(Some(OsString::from("zsh"))),
+            OsString::from("/bin/sh")
+        );
+    }
+
+    #[test]
+    fn login_shell_accepts_known_shell() {
+        assert_eq!(
+            login_shell(Some(OsString::from("/bin/zsh"))),
+            OsString::from("/bin/zsh")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn login_shell_accepts_windows_command_processor() {
+        assert_eq!(
+            login_shell(Some(OsString::from("cmd.exe"))),
+            OsString::from("cmd.exe")
+        );
+    }
+
+    #[test]
+    fn default_shell_is_available() {
+        assert!(!default_shell().unwrap_or_default().is_empty());
+    }
+}

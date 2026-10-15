@@ -1,0 +1,154 @@
+name: prospero-relay
+
+services:
+  mysql:
+    image: mysql:8.4.4-oraclelinux9
+    # MySQL 8.4 defaults to caching_sha2_password.  The old
+    # --default-authentication-plugin switch was removed in 8.4 and makes a
+    # fresh container fail before it can initialize its data directory.
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-prospero_relay}
+      MYSQL_USER: ${MYSQL_USER:-prospero}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    expose: ["3306"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      # The official image starts a temporary bootstrap mysqld that answers
+      # ping, then replaces it with the final server. Do not release migrate
+      # during that transient window.
+      start_period: 30s
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+    networks: [relay-backend]
+
+  redis:
+    image: redis:7.4.2-alpine3.21
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis-data:/data
+    expose: ["6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks: [relay-backend]
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: apps/relay/Dockerfile
+    image: prospero-relay:0.0.13
+    command: ["node", "dist/migrate.js"]
+    working_dir: /srv/prospero/apps/relay
+    environment:
+      MYSQL_URL: mysql://${MYSQL_USER:-prospero}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-prospero_relay}
+      REDIS_URL: redis://redis:6379
+      MIGRATIONS_DIR: /srv/prospero/apps/relay/migrations
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+    ulimits:
+      core: 0
+    networks: [relay-backend]
+
+  relay:
+    image: prospero-relay:0.0.13
+    build:
+      context: ../..
+      dockerfile: apps/relay/Dockerfile
+    environment:
+      RELAY_HOST: 0.0.0.0
+      RELAY_PORT: 8787
+      MYSQL_URL: mysql://${MYSQL_USER:-prospero}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-prospero_relay}
+      REDIS_URL: redis://redis:6379
+      METRICS_INTERNAL_ONLY: "true"
+      # Only Caddy has this fixed backend address. It supplies a sanitized
+      # client IP for per-source rate limiting; direct callers cannot forge it.
+      RELAY_TRUSTED_PROXY_IPS: "172.30.0.2"
+      # Defaults are safe for ordinary deployments.  The capacity harness
+      # overrides these two guards for its known benchmark source addresses.
+      AUTH_RATE_PER_MINUTE: ${AUTH_RATE_PER_MINUTE:-20}
+      CONNECTION_RATE_PER_MINUTE: ${CONNECTION_RATE_PER_MINUTE:-60}
+      MAX_STREAMS_PER_ROUTE: ${MAX_STREAMS_PER_ROUTE:-8}
+      CLEANUP_INTERVAL_MS: ${CLEANUP_INTERVAL_MS:-3600000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    expose: ["8787"]
+    # 5k host controls + 1k bidirectional data pairs require substantially
+    # more than a platform's common 1024-FD default. Keep this explicit so an
+    # image/runtime change cannot silently reduce the capacity envelope.
+    ulimits:
+      nofile:
+        soft: ${RELAY_NOFILE_SOFT:-131072}
+        hard: ${RELAY_NOFILE_HARD:-131072}
+      core: 0
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    networks: [relay-backend]
+
+  caddy:
+    image: caddy:2.8.4-alpine
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN:?set public DNS name in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      relay:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    ulimits:
+      nofile:
+        soft: ${CADDY_NOFILE_SOFT:-131072}
+        hard: ${CADDY_NOFILE_HARD:-131072}
+    restart: unless-stopped
+    networks:
+      relay-backend:
+        ipv4_address: 172.30.0.2
+      relay-public: {}
+
+volumes:
+  mysql-data:
+  redis-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  # MySQL, Redis, and relay never receive a host-published port. Caddy is the
+  # only bridge between the public network and this internal network.
+  relay-backend:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  relay-public: {}

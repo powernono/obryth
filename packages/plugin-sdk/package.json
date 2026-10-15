@@ -1,0 +1,16 @@
+{
+  "name": "@obryth/plugin-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit --strict --skipLibCheck --target ES2022 --moduleResolution bundler --module ESNext src/index.ts"
+  },
+  "dependencies": {
+    "@obryth/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

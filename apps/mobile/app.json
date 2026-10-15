@@ -1,0 +1,50 @@
+{
+  "expo": {
+    "name": "Obryth",
+    "slug": "obryth",
+    "scheme": "obryth",
+    "version": "0.1.0",
+    "orientation": "default",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "bundleIdentifier": "app.obryth.mobile",
+      "supportsTablet": true,
+      "infoPlist": {
+        "UIFileSharingEnabled": true,
+        "LSSupportsOpeningDocumentsInPlace": true,
+        "NSLocalNetworkUsageDescription": "连接你选择的电脑，以远程使用本地 Agent。",
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
+    },
+    "android": {
+      "package": "app.obryth.mobile",
+      "softwareKeyboardLayoutMode": "resize",
+      "predictiveBackGestureEnabled": true
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "deploymentTarget": "16.4"
+          },
+          "android": {
+            "minSdkVersion": 29,
+            "targetSdkVersion": 36,
+            "usesCleartextTraffic": true
+          }
+        }
+      ],
+      "expo-secure-store"
+    ],
+    "experiments": {
+      "autolinkingModuleResolution": true
+    },
+    "platforms": [
+      "ios",
+      "android"
+    ]
+  }
+}

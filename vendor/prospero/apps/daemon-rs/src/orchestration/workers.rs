@@ -1,0 +1,711 @@
+//! Worker launch/stop and worktree lifecycle service (Stage 8).
+//!
+//! This is the Rust-mode counterpart of the legacy `DispatchService` +
+//! `WorktreeAssetService`: it wires the DAG store to the structured agent
+//! agent runtime and to `git worktree`. Two deliberate scope reductions versus
+//! legacy:
+//!
+//! * only structured Claude/Codex/DeepSeek/OpenCode workers are launched (other agents/PTYs
+//!   stay explicitly unbridged and the desktop rejects them with "尚未接入");
+//!
+//! Worktree safety is unchanged: directories are registered before the worker
+//! session exists, preserved on every settle/stop/run outcome, and only removed
+//! through an explicit cleanup that re-inspects with read-only git commands.
+
+use std::path::{Path, PathBuf};
+
+use super::gitops::{
+    WorktreeCreate, create_worktree, delete_branch, inspect_asset, remove_worktree, repo_root,
+    worktree_default_path,
+};
+use super::*;
+use crate::agent::{Agents, CreateAgentSession};
+use crate::database::{now, validate_text};
+use crate::error::{Error, Result};
+use crate::worker::Database;
+
+fn worker_prompt(
+    task: &Task,
+    session_id: &str,
+    cwd: &str,
+    coordinator: Option<&str>,
+    skills: &[String],
+) -> String {
+    let mut lines = vec![
+        "你是 Prospero 编排中的 worker。只处理下面这一个任务，不要自行创建或派发其他 worker。"
+            .to_string(),
+        format!("任务 ID: {}", task.id),
+        format!("会话 ID: {session_id}"),
+        format!("协调者会话: {}", coordinator.unwrap_or("未指定")),
+        format!("工作目录: {cwd}"),
+        format!("任务: {}", task.title),
+    ];
+    if !skills.is_empty() {
+        let list = skills
+            .iter()
+            .map(|skill| format!("${skill}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push(format!("显式 Skills: {list}"));
+    }
+    lines.push(format!("要求:\n{}", task.spec));
+    lines.extend([
+        format!(
+            "完成并自行验证后，运行 `prospero task done --id {} --body <交付摘要>`。",
+            task.id
+        ),
+        format!(
+            "如果无法完成，运行 `prospero task fail --id {} --body <原因>`。",
+            task.id
+        ),
+        "仅停止、空闲或退出不会把任务标记为完成。".to_string(),
+    ]);
+    lines.join("\n")
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Launch a structured worker for one task. The ordering mirrors legacy
+/// persistence boundaries: worktree directory → asset registration (so the
+/// disk resource is indexed even if the next step crashes) → agent session →
+/// dispatch row + task `dispatched` in one transaction → worker brief →
+/// dispatch `running`.
+pub(super) async fn launch_worker_start(
+    database: &Database,
+    agents: &Agents,
+    input: StartWorker,
+    operation_id: &str,
+) -> Result<WorkerStartOutcome> {
+    validate_text(&input.cwd, 4096, false)?;
+    if !Path::new(&input.cwd).is_absolute() {
+        return Err(Error::Invalid("cwd must be absolute".into()));
+    }
+    let mode = match input.worktree.as_str() {
+        "new" => "new",
+        "none" => "none",
+        _ => return Err(Error::Invalid("worktree must be new or none".into())),
+    };
+    if let Some(kind) = input.kind.as_deref()
+        && kind != "structured"
+    {
+        return Err(Error::Invalid("Rust worker 当前仅支持 structured".into()));
+    }
+    if !matches!(
+        input.agent,
+        crate::protocol::AgentKind::Claude
+            | crate::protocol::AgentKind::Codex
+            | crate::protocol::AgentKind::Deepseek
+            | crate::protocol::AgentKind::Opencode
+    ) {
+        return Err(Error::Invalid(
+            "Rust worker 当前仅支持 Claude/Codex/DeepSeek/OpenCode".into(),
+        ));
+    }
+    let policy = match input.approval_policy.as_deref().unwrap_or("standard") {
+        "strict" | "standard" => false,
+        "yolo" => true,
+        _ => return Err(Error::Invalid("approvalPolicy is invalid".into())),
+    };
+    let account_id = match input.account_id.as_deref() {
+        None | Some("") if input.agent == crate::protocol::AgentKind::Opencode => {
+            return Err(Error::Invalid(
+                "OpenCode worker 需要 OpenAI Chat Completions API Profile".into(),
+            ));
+        }
+        None | Some("") | Some(crate::accounts::NATIVE_CLAUDE_ID) => None,
+        Some(_) if input.agent == crate::protocol::AgentKind::Deepseek => {
+            return Err(Error::Invalid(
+                "DeepSeek worker 使用本机 dsh 账号，不支持绑定 Prospero 账号".into(),
+            ));
+        }
+        Some(id) => {
+            crate::database::validate_id(id)?;
+            let data = database.directory().to_owned();
+            let id = id.to_owned();
+            let record = database
+                .call_control("worker.start.account", move |store| {
+                    store.managed_snapshot_row(&data, &id)
+                })
+                .await?;
+            if input.agent == crate::protocol::AgentKind::Opencode {
+                match record
+                    .api_profile
+                    .as_ref()
+                    .map(|profile| profile.protocol())
+                {
+                    Some("openai_chat_completions") => {}
+                    _ => {
+                        return Err(Error::Invalid(
+                            "OpenCode worker 需要 OpenAI Chat Completions API Profile".into(),
+                        ));
+                    }
+                }
+            }
+            Some(record.id)
+        }
+    };
+    let task = {
+        let id = input.task_id.clone();
+        database
+            .call_control("worker.start.task", move |store| store.task(&id))
+            .await?
+    };
+    let run = {
+        let id = task.run_id.clone();
+        database
+            .call_control("worker.start.run", move |store| store.orch_run(&id))
+            .await?
+    };
+    if run.status != RunStatus::Active {
+        return Err(Error::Invalid(
+            "the run is settled; history is read-only".into(),
+        ));
+    }
+    if matches!(
+        run.automation.as_ref().map(|automation| automation.state),
+        Some(AutomationState::Running)
+    ) && !operation_id.starts_with("automation-")
+    {
+        return Err(Error::Invalid(
+            "任务图正在自动执行；请先暂停，再编辑或手工派发".into(),
+        ));
+    }
+
+    // ── Worktree (optional external resource) ──────────────────────────────
+    let mut asset: Option<WorktreeAsset> = None;
+    let worker_cwd = if mode == "new" {
+        let cwd = input.cwd.clone();
+        let stamp = super::store::fingerprint("worker.start.worktree", &operation_id);
+        let name = format!("worker-{}-{}", task.id, stamp);
+        let branch = format!("prospero/{}/{}/{}", task.run_id, task.id, stamp);
+        let planned = tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, String)> {
+            let repo = repo_root(Path::new(&cwd))?.ok_or_else(|| {
+                Error::Invalid(format!("{cwd} 不在 git 仓库中，不能创建 worktree"))
+            })?;
+            let path = worktree_default_path(&repo, &name);
+            Ok((canonical(&repo), path, branch))
+        })
+        .await
+        .map_err(|_| Error::Closed)??;
+        let (repo, path, branch) = planned;
+        {
+            let id = operation_id.to_owned();
+            let repo = repo.to_string_lossy().into_owned();
+            let path = path.to_string_lossy().into_owned();
+            let branch = branch.clone();
+            database
+                .call_control("worker.start.plan_worktree", move |store| {
+                    store.plan_worker_start_worktree(&id, &repo, &path, &branch)
+                })
+                .await?;
+        }
+        let created = tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf, String)> {
+            create_worktree(
+                &repo,
+                &WorktreeCreate {
+                    path: path.clone(),
+                    branch: branch.clone(),
+                },
+            )?;
+            Ok((canonical(&repo), canonical(&path), branch))
+        })
+        .await
+        .map_err(|_| Error::Closed)??;
+        let (repo, path, branch) = created;
+        let registered = {
+            let operation_id = operation_id.to_owned();
+            let run_id = task.run_id.clone();
+            let task_id = task.id.clone();
+            let repo_text = repo.to_string_lossy().into_owned();
+            let path_text = path.to_string_lossy().into_owned();
+            database
+                .call_control("worker.start.record_worktree", move |store| {
+                    store.record_worker_start_worktree(
+                        &operation_id,
+                        RegisterWorktree {
+                            kind: WorktreeAssetKind::Worker,
+                            run_id,
+                            task_id: Some(task_id),
+                            repo: repo_text,
+                            path: path_text,
+                            branch: Some(branch),
+                        },
+                    )
+                })
+                .await?
+        };
+        let cwd = registered.path.clone();
+        asset = Some(registered);
+        cwd
+    } else {
+        canonical(Path::new(&input.cwd))
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    // ── Explicit skill bindings (strict: every name must resolve) ──────────
+    // Mirrors legacy dispatch: undeclared `$mentions` in the spec are
+    // rejected, and bound skills must exist and be readable in the worker cwd.
+    let skill_names = {
+        let worker_cwd = worker_cwd.clone();
+        let spec = task.spec.clone();
+        let requested = if input.skills.is_empty() {
+            task.skills.clone()
+        } else {
+            input.skills.clone()
+        };
+        match tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            crate::skills::assert_mentions_bound(&spec, &requested)?;
+            let resolved = crate::skills::resolve_explicit_skills(&worker_cwd, &requested)?;
+            Ok(resolved.into_iter().map(|skill| skill.name).collect())
+        })
+        .await
+        .map_err(|_| Error::Closed)?
+        {
+            Ok(names) => names,
+            Err(error) => {
+                // The worktree already exists on disk and is registered; a
+                // strict skill failure must preserve it rather than orphan it.
+                if let Some(asset) = &asset {
+                    let id = asset.id.clone();
+                    let message = format!(
+                        "worker Skill 解析失败；已保留工作树和分支：{}",
+                        error_message(&error)
+                    );
+                    let _ = database
+                        .call_control("worker.start.preserve_worktree", move |store| {
+                            store.preserve_worktree_asset(&id, Some(&message))
+                        })
+                        .await;
+                }
+                return Err(error);
+            }
+        }
+    };
+
+    // ── Agent session ──────────────────────────────────────────────────────
+    let title = {
+        let raw = format!("worker {}", task.title);
+        if raw.chars().count() > 200 {
+            let cut = raw.char_indices().nth(200).map_or(raw.len(), |(i, _)| i);
+            format!("{}…", &raw[..cut])
+        } else {
+            raw
+        }
+    };
+    let session_id = super::start::worker_session_id(operation_id);
+    {
+        let operation_id = operation_id.to_owned();
+        let session_id = session_id.clone();
+        database
+            .call_control("worker.start.plan_session", move |store| {
+                store.plan_worker_start_session(&operation_id, &session_id)
+            })
+            .await?;
+    }
+    let head = match agents
+        .create_with_id(
+            CreateAgentSession {
+                agent: input.agent,
+                title,
+                workspace: worker_cwd.clone(),
+                auto_approve: policy,
+                mode: None,
+                model: None,
+                effort: None,
+                agent_preset: None,
+                account_id,
+                resume: None,
+            },
+            session_id.clone(),
+        )
+        .await
+    {
+        Ok(head) => head,
+        Err(error) => {
+            if let Some(asset) = &asset {
+                let id = asset.id.clone();
+                let message = format!(
+                    "worker 会话创建失败；已保留工作树和分支：{}",
+                    error_message(&error)
+                );
+                let _ = database
+                    .call_control("worker.start.preserve_worktree", move |store| {
+                        store.preserve_worktree_asset(&id, Some(&message))
+                    })
+                    .await;
+            }
+            return Err(error);
+        }
+    };
+    let recorded_session = {
+        let operation_id = operation_id.to_owned();
+        let session_id = head.id.clone();
+        database
+            .call_control("worker.start.record_session", move |store| {
+                store.record_worker_start_session(&operation_id, &session_id)
+            })
+            .await
+    };
+    if let Err(error) = recorded_session {
+        let _ = agents.close(&head.id).await;
+        if let Some(asset) = &asset {
+            let id = asset.id.clone();
+            let message = format!(
+                "worker 会话登记失败；已保留工作树和分支：{}",
+                error_message(&error)
+            );
+            let _ = database
+                .call_control("worker.start.preserve_worktree", move |store| {
+                    store.preserve_worktree_asset(&id, Some(&message))
+                })
+                .await;
+        }
+        return Err(error);
+    }
+
+    // ── Dispatch row + asset link (one transaction) ────────────────────────
+    let outcome = {
+        let task_id = task.id.clone();
+        let operation_id = operation_id.to_owned();
+        let session_id = head.id.clone();
+        let worktree_path = asset.as_ref().map(|value| value.path.clone());
+        database
+            .call_control("worker.start.commit_dispatch", move |store| {
+                store.commit_worker_start_dispatch(
+                    &operation_id,
+                    &task_id,
+                    &session_id,
+                    worktree_path.as_deref(),
+                )
+            })
+            .await
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // Never leave an orphaned agent process after a failed dispatch.
+            let _ = agents.close(&head.id).await;
+            if let Some(asset) = &asset {
+                let id = asset.id.clone();
+                let message = format!(
+                    "worker 派发未完成；已保留工作树和分支：{}",
+                    error_message(&error)
+                );
+                let _ = database
+                    .call_control("worker.start.preserve_worktree", move |store| {
+                        store.preserve_worktree_asset(&id, Some(&message))
+                    })
+                    .await;
+            }
+            return Err(error);
+        }
+    };
+
+    // ── Worker brief, then running ─────────────────────────────────────────
+    let prompt = worker_prompt(
+        &outcome.task,
+        &head.id,
+        &worker_cwd,
+        run.coordinator_session_id.as_deref(),
+        &skill_names,
+    );
+    {
+        let operation_id = operation_id.to_owned();
+        database
+            .call_control("worker.start.delivery", move |store| {
+                store.mark_worker_start_delivering(&operation_id)
+            })
+            .await?;
+    }
+    if let Err(error) = agents.send(&head.id, prompt, None, Vec::new()).await {
+        let reason = format!("worker prompt delivery failed: {}", error_message(&error));
+        let _ = agents.close(&head.id).await;
+        let operation_id = operation_id.to_owned();
+        let _ = database
+            .call_control("worker.start.delivery_failed", move |store| {
+                store.fail_worker_start_delivery(&operation_id, &reason)
+            })
+            .await;
+        return Err(error);
+    }
+    let operation_id = operation_id.to_owned();
+    database
+        .call_control("worker.start.complete", move |store| {
+            store.complete_worker_start(&operation_id)
+        })
+        .await
+}
+
+/// Stop a live worker: kill its agent session and converge the dispatch to
+/// abandoned (task fails by default; `cancelled` is opt-in). Killing an
+/// already-gone session is a no-op, so retrying stop is safe: with no live
+/// dispatch the latest dispatch and current task are returned.
+pub async fn stop_worker(
+    database: &Database,
+    agents: &Agents,
+    input: StopWorker,
+) -> Result<SettleOutcome> {
+    crate::database::validate_id(&input.task_id)?;
+    let reason = input
+        .reason
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "由用户停止 worker".into());
+    validate_text(&reason, 8192, false)?;
+    let final_status = match input.final_status.as_deref() {
+        None | Some("failed") => TaskStatus::Failed,
+        Some("cancelled") => TaskStatus::Cancelled,
+        Some(_) => {
+            return Err(Error::Invalid(
+                "finalStatus must be failed or cancelled".into(),
+            ));
+        }
+    };
+    let live = {
+        let id = input.task_id.clone();
+        database
+            .call_control("worker.stop.live_dispatch", move |store| {
+                store.live_dispatch_for_task(&id)
+            })
+            .await?
+    };
+    let Some(dispatch) = live else {
+        // Idempotent replay shape: nothing live to stop.
+        let task_id = input.task_id.clone();
+        let task = database
+            .call_control("worker.stop.task", move |store| store.task(&task_id))
+            .await?;
+        let task_id = task.id.clone();
+        let dispatch = database
+            .call_control("worker.stop.dispatch", move |store| {
+                store.latest_dispatch_for_task(&task_id)
+            })
+            .await?
+            .ok_or(Error::NotFound)?;
+        match agents.close(&dispatch.session_id).await {
+            Ok(()) | Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        return Ok(SettleOutcome { task, dispatch });
+    };
+    let dispatch_id = dispatch.id.clone();
+    let reason_text = reason.clone();
+    let outcome = database
+        .call_control("worker.stop.settle", move |store| {
+            store.abandon_dispatch(&dispatch_id, &reason_text, final_status)
+        })
+        .await?;
+    agents.close(&dispatch.session_id).await?;
+    Ok(outcome)
+}
+
+/// Read-only inspection; the result is recorded on the asset.
+pub async fn inspect_worktree(
+    database: &Database,
+    asset_id: &str,
+    target_ref: Option<String>,
+) -> Result<WorktreeInspection> {
+    crate::database::validate_id(asset_id)?;
+    let asset = {
+        let id = asset_id.to_owned();
+        database
+            .call(move |store| store.worktree_asset(&id))
+            .await?
+    };
+    let target = target_ref.unwrap_or_else(|| "HEAD".into());
+    let inspected = {
+        let path = asset.path.clone();
+        let repo = asset.repo.clone();
+        let branch = asset.branch.clone();
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || {
+            inspect_asset(
+                Path::new(&path),
+                Path::new(&repo),
+                branch.as_deref(),
+                &target,
+                now(),
+            )
+        })
+        .await
+        .map_err(|_| Error::Closed)?
+    };
+    let id = asset.id.clone();
+    let inspection = inspected.inspection.clone();
+    database
+        .call(move |store| store.record_worktree_inspection(&id, &inspection))
+        .await?;
+    Ok(inspected.inspection)
+}
+
+/// Explicit, freshly re-inspected cleanup. Every refusal state preserves the
+/// directory; only `safe_to_clean`/`equivalent` after a new read-only pass can
+/// proceed, and `git worktree remove` runs without force as the second gate.
+pub async fn cleanup_worktree(
+    database: &Database,
+    asset_id: &str,
+    request: CleanupWorktree,
+) -> Result<WorktreeCleanupResult> {
+    if !request.confirm {
+        return Err(Error::Invalid(
+            "清理工作树必须显式传 confirm: true；默认始终保留目录和分支".into(),
+        ));
+    }
+    crate::database::validate_id(asset_id)?;
+    let asset = {
+        let id = asset_id.to_owned();
+        database
+            .call(move |store| store.worktree_asset(&id))
+            .await?
+    };
+    // A delivered dispatch does not mean its structured session has exited;
+    // never remove a tree a live session may still write into.
+    let leases = {
+        let path = asset.path.clone();
+        database
+            .call(move |store| store.active_sessions_under(&path))
+            .await?
+    };
+    if !leases.is_empty() {
+        let id = asset.id.clone();
+        let message = format!(
+            "会话 {} 仍在使用此工作树；已保留目录，待其终态后再清理",
+            leases.join(", ")
+        );
+        let preserved = message.clone();
+        let _ = database
+            .call(move |store| store.preserve_worktree_asset(&id, Some(&preserved)))
+            .await;
+        return Err(Error::Invalid(message));
+    }
+    let target = request.target_ref.unwrap_or_else(|| "HEAD".into());
+    let resolved = {
+        let path = asset.path.clone();
+        let repo = asset.repo.clone();
+        let branch = asset.branch.clone();
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || {
+            inspect_asset(
+                Path::new(&path),
+                Path::new(&repo),
+                branch.as_deref(),
+                &target,
+                now(),
+            )
+        })
+        .await
+        .map_err(|_| Error::Closed)?
+    };
+    let inspection = resolved.inspection.clone();
+    let id = asset.id.clone();
+    let recorded_inspection = inspection.clone();
+    let recorded = database
+        .call(move |store| store.record_worktree_inspection(&id, &recorded_inspection))
+        .await?;
+    if !matches!(
+        inspection.state,
+        WorktreeAssetState::SafeToClean | WorktreeAssetState::Equivalent
+    ) {
+        return Err(Error::Invalid(format!(
+            "工作树当前为 {}，不能安全清理：{}",
+            asset_state(inspection.state),
+            inspection
+                .message
+                .as_deref()
+                .unwrap_or("请先处理或显式保留")
+        )));
+    }
+    let (Some(repo), Some(worktree_path), Some(source_commit)) = (
+        resolved.repo,
+        resolved.worktree_path,
+        resolved.source_commit,
+    ) else {
+        return Err(Error::Invalid(
+            "缺少可靠的源仓或待删分支提交；已保留工作树和分支".into(),
+        ));
+    };
+
+    let removed = {
+        let repo = repo.clone();
+        let path = worktree_path.clone();
+        tokio::task::spawn_blocking(move || {
+            remove_worktree(Path::new(&repo), Path::new(&path), false)
+        })
+        .await
+        .map_err(|_| Error::Closed)?
+    };
+    if let Err(error) = removed {
+        return Err(Error::Invalid(format!(
+            "Git 拒绝清理工作树；已保留目录和分支：{}",
+            error_message(&error)
+        )));
+    }
+    if Path::new(&worktree_path).exists() {
+        return Err(Error::Invalid(
+            "Git 返回成功但工作树路径仍存在；为避免误报，资产保持未清理状态".into(),
+        ));
+    }
+
+    let mut branch_deleted = false;
+    let mut warning: Option<String> = None;
+    if request.delete_branch
+        && let Some(branch) = &inspection.branch
+    {
+        let delete = {
+            let repo = repo.clone();
+            let branch = branch.clone();
+            let commit = source_commit.clone();
+            tokio::task::spawn_blocking(move || delete_branch(Path::new(&repo), &branch, &commit))
+                .await
+                .map_err(|_| Error::Closed)?
+        };
+        match delete {
+            Ok(()) => branch_deleted = true,
+            Err(error) => {
+                warning = Some(format!(
+                    "工作树已移除，但分支 {branch} 已保留：{}",
+                    error_message(&error)
+                ));
+            }
+        }
+    }
+
+    let cleanup = WorktreeCleanup {
+        removed_at: now(),
+        branch_deleted,
+        warning: warning.clone(),
+    };
+    let id = asset.id.clone();
+    let cleaned = database
+        .call(move |store| store.mark_worktree_cleaned(&id, &cleanup))
+        .await?;
+    Ok(WorktreeCleanupResult {
+        asset: cleaned,
+        inspection: recorded.last_inspection.unwrap_or(inspection),
+        branch_deleted,
+        warning,
+    })
+}
+
+fn asset_state(state: WorktreeAssetState) -> &'static str {
+    match state {
+        WorktreeAssetState::Active => "active",
+        WorktreeAssetState::Preserved => "preserved",
+        WorktreeAssetState::Missing => "missing",
+        WorktreeAssetState::Dirty => "dirty",
+        WorktreeAssetState::Unmerged => "unmerged",
+        WorktreeAssetState::Equivalent => "equivalent",
+        WorktreeAssetState::SafeToClean => "safe_to_clean",
+        WorktreeAssetState::Cleaned => "cleaned",
+        WorktreeAssetState::Unknown => "unknown",
+    }
+}
+
+pub(super) fn error_message(error: &Error) -> String {
+    match error {
+        Error::Invalid(message) => message.clone(),
+        other => other.to_string(),
+    }
+}

@@ -1,0 +1,299 @@
+/**
+ * 终端视图:WebView 加载 daemon 托管的 term.html(xterm.js),
+ * WS 保持在 RN 侧单连接,WebView 只做渲染与输入采集。
+ * attach 流程:page ready → 上报 fit 尺寸 → resize → attach(带 lastSeq 续传)。
+ */
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef, type ReactNode } from "react";
+import { Pressable, StyleSheet, Text, View } from "react-native";
+import { WebView, type WebViewMessageEvent } from "react-native-webview";
+import type { HostConnection } from "@/lib/connection";
+import { toast } from "@/components/Toast";
+import { deliveryFailureText, type DeliveryResult } from "@/lib/outbound-queue";
+import { subscribeFocusedTerminal } from "@/lib/focused-session-stream";
+import { useFocusedSessionEffect } from "@/lib/use-focused-session-effect";
+import { TERMINAL_HTML, TERMINAL_FONT_FAMILY } from "./terminal-html";
+
+// source 对象保持稳定,避免会话状态刷新时让原生 WebView 误判为需要重新加载。
+const TERMINAL_SOURCE = { html: TERMINAL_HTML } as const;
+
+interface Props {
+  conn: HostConnection;
+  sid: string;
+  /** 由原生层控制；WebView 就绪和后续变化都会收到 font 消息。 */
+  fontSize: number;
+  /** 捏合缩放后回报,让 A+/A− 的基准与终端保持一致 */
+  onFontSize?: (size: number) => void;
+  /** 洪峰时的渲染帧率与吞吐;Release 构建里 console 是哑的,只能走 UI */
+  onPerf?: (p: { fps: number; kb: number; renderer: string }) => void;
+  /** 断线后的 shell 字节不能安全补发，WebView 必须被冻结。 */
+  inputEnabled?: boolean;
+  sessionEnded?: boolean;
+  endedActions?: ReactNode;
+  onInputB64?: (data: string) => DeliveryResult;
+  disconnectedMessage?: string;
+  onRetryConnection?: () => void;
+}
+
+export interface TerminalHandle {
+  scrollToBottom(): void;
+  /** 收起键盘 */
+  blur(): void;
+}
+
+interface BridgeUp {
+  kind: "ready" | "resized" | "input" | "perf" | "fontSize";
+  renderer?: string;
+  cols?: number;
+  rows?: number;
+  data?: string;
+  fps?: number;
+  kb?: number;
+  size?: number;
+}
+
+const TerminalInner = forwardRef<TerminalHandle, Props>(function Terminal(
+  {
+    conn,
+    sid,
+    fontSize,
+    onFontSize,
+    onPerf,
+    inputEnabled = true,
+    sessionEnded = false,
+    endedActions,
+    onInputB64,
+    disconnectedMessage = "主机未连接；终端输入已冻结。",
+    onRetryConnection,
+  },
+  ref,
+) {
+  const webRef = useRef<WebView>(null);
+  const readyRef = useRef(false);
+  const activeRef = useRef(false);
+  const metricsRef = useRef(onPerf !== undefined);
+  const attachedRef = useRef(false);
+  const lastSeqRef = useRef(0);
+  const queueRef = useRef<object[]>([]);
+  const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
+  const fontSizeRef = useRef(fontSize);
+
+  const batchRef = useRef<object[]>([]);
+  const flushRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /**
+   * 把同一 tick 内到达的消息合并成一批再过桥。
+   *
+   * 每次跨桥的固定开销不小,洪峰下几十条/秒逐条过是纯浪费。用 setTimeout(0)
+   * 而不是固定间隔,是因为【打字回显】不能被批处理拖慢 —— 单独一条消息
+   * 会在当前 tick 结束就立刻发出,只有真正堆积时才会合并。
+   */
+  const flush = useCallback(() => {
+    if (flushRef.current !== null) clearTimeout(flushRef.current);
+    flushRef.current = null;
+    const batch = batchRef.current;
+    if (batch.length === 0) return;
+    batchRef.current = [];
+    webRef.current?.postMessage(JSON.stringify(batch));
+  }, []);
+
+  const rx = useCallback(
+    (obj: object) => {
+      if (!readyRef.current) {
+        queueRef.current.push(obj);
+        return;
+      }
+      batchRef.current.push(obj);
+      if (flushRef.current === null) flushRef.current = setTimeout(flush, 0);
+    },
+    [flush],
+  );
+
+  const tryAttach = useCallback(() => {
+    if (!activeRef.current || !readyRef.current || !conn.isConnected || !sizeRef.current) return;
+    conn.resize(sid, sizeRef.current.cols, sizeRef.current.rows);
+    conn.attach(sid, lastSeqRef.current > 0 ? lastSeqRef.current : undefined);
+    attachedRef.current = true;
+  }, [conn, sid]);
+
+  // font 不走 shell 输入通道，也不影响 attach；WebView 自己在收到 font 后 fit，
+  // 这样首次 resized/attach 已经使用正确字号。系统 Dynamic Type 变更则由受控 prop
+  // 触发同一条桥接消息，不重建 WebView 或 shell 会话。
+  useEffect(() => {
+    fontSizeRef.current = fontSize;
+    if (readyRef.current) rx({ kind: "font", size: fontSize, family: TERMINAL_FONT_FAMILY });
+  }, [fontSize, rx]);
+
+  useEffect(() => {
+    metricsRef.current = onPerf !== undefined;
+    if (readyRef.current) rx({ kind: "activity", active: activeRef.current, metrics: metricsRef.current });
+  }, [onPerf, rx]);
+
+  useFocusedSessionEffect(useCallback(() => {
+    if (sessionEnded) {
+      activeRef.current = false;
+      if (readyRef.current) { rx({ kind: "blur" }); flush(); }
+      return () => undefined;
+    }
+    activeRef.current = true;
+    if (readyRef.current) rx({ kind: "activity", active: true, metrics: metricsRef.current });
+    const cleanup = subscribeFocusedTerminal({
+      conn, sid, cursor: lastSeqRef,
+      snapshot: (message) => rx({ kind: "snapshot", ansi: message.ansi, cols: message.cols, rows: message.rows }),
+      output: (message) => rx({ kind: "output", dataB64: message.dataB64 }),
+      flush,
+      attach: tryAttach,
+    });
+    return () => {
+      activeRef.current = false;
+      cleanup();
+      attachedRef.current = false;
+      if (readyRef.current) {
+        rx({ kind: "blur" });
+        rx({ kind: "activity", active: false, metrics: false });
+        flush();
+      }
+    };
+  }, [conn, sid, flush, rx, tryAttach, sessionEnded]));
+
+  const onMessage = useCallback(
+    (e: WebViewMessageEvent) => {
+      let msg: BridgeUp;
+      try {
+        msg = JSON.parse(e.nativeEvent.data) as BridgeUp;
+      } catch {
+        return;
+      }
+      switch (msg.kind) {
+        case "ready":
+          // 页面(重新)加载:内容为空,必须全量快照
+          readyRef.current = true;
+          attachedRef.current = false;
+          lastSeqRef.current = 0;
+          rx({ kind: "activity", active: activeRef.current, metrics: metricsRef.current });
+          // term.html 在收到 font 后才允许首次 fit，因此它产生的 resized/attach
+          // 必然反映这一受控字号。字体消息排在重放输出之前，避免初始帧闪回默认值。
+          rx({ kind: "font", size: fontSizeRef.current, family: TERMINAL_FONT_FAMILY });
+          // 之前这里直接清空队列 —— 页面就绪前到达的消息被丢掉了。
+          // 现在补发,后续的全量快照会覆盖它们,但丢弃从来不是对的默认。
+          if (queueRef.current.length > 0) {
+            const pending = queueRef.current;
+            queueRef.current = [];
+            for (const obj of pending) rx(obj);
+          }
+          break;
+        case "resized":
+          if (typeof msg.cols !== "number" || typeof msg.rows !== "number") return;
+          sizeRef.current = { cols: msg.cols, rows: msg.rows };
+          if (!activeRef.current) break;
+          if (!attachedRef.current) tryAttach();
+          else conn.resize(sid, msg.cols, msg.rows);
+          break;
+        case "input":
+          if (activeRef.current && typeof msg.data === "string" && inputEnabled) {
+            const result = onInputB64 ? onInputB64(msg.data) : conn.inputB64(sid, msg.data);
+            if (!result.accepted) toast(deliveryFailureText(result));
+          }
+          break;
+        case "fontSize":
+          if (activeRef.current && typeof msg.size === "number") onFontSize?.(msg.size);
+          break;
+        case "perf":
+          // Release 构建里 console.log 被剥掉,验收要看数就必须走 UI
+          if (activeRef.current && typeof msg.fps === "number" && typeof msg.kb === "number") {
+            onPerf?.({ fps: msg.fps, kb: msg.kb, renderer: msg.renderer ?? "?" });
+          }
+          break;
+      }
+    },
+    [conn, sid, tryAttach, rx, onFontSize, onPerf, inputEnabled, onInputB64],
+  );
+
+  useImperativeHandle(ref, () => ({
+    scrollToBottom: () => rx({ kind: "scrollBottom" }),
+    blur: () => rx({ kind: "blur" }),
+  }), [rx]);
+
+  return (
+    <View style={styles.wrap}>
+      <WebView
+        ref={webRef}
+        source={TERMINAL_SOURCE}
+        onMessage={onMessage}
+        style={styles.web}
+        keyboardDisplayRequiresUserAction={false}
+        // 不要 hideKeyboardAccessoryView:那条系统辅助栏上有「完成」和听写入口,
+        // 隐藏它省下的一点高度,代价是键盘收不起来、也没法语音输入
+        setSupportMultipleWindows={false}
+        allowsLinkPreview={false}
+        webviewDebuggingEnabled={__DEV__}
+        androidLayerType="hardware"
+        originWhitelist={["*"]}
+        bounces={false}
+        overScrollMode="never"
+        automaticallyAdjustContentInsets={false}
+      />
+      {!inputEnabled && (
+        <View style={styles.inputFrozen} pointerEvents="auto">
+          <View
+            style={styles.inputFrozenCard}
+            accessible={!sessionEnded}
+            accessibilityLiveRegion="polite"
+            accessibilityLabel={disconnectedMessage}
+          >
+            <Text style={styles.inputFrozenText}>{disconnectedMessage}</Text>
+            {sessionEnded && endedActions}
+            {onRetryConnection && (
+              <Pressable
+                style={({ pressed }) => [styles.inputFrozenRetry, pressed && styles.inputFrozenRetryPressed]}
+                onPress={onRetryConnection}
+                accessibilityRole="button"
+                accessibilityLabel="重新连接主机后继续终端输入"
+              >
+                <Text style={styles.inputFrozenRetryText}>重试连接</Text>
+              </Pressable>
+            )}
+          </View>
+        </View>
+      )}
+    </View>
+  );
+});
+
+/**
+ * 顶部状态计时每秒都会更新;终端连接和 sid 没变时不应连带重渲染 WebView。
+ * 这既避免无意义的原生属性同步,也守住正在进行的输入法组合态。
+ */
+export const Terminal = memo(forwardRef<TerminalHandle, Props>(function Terminal(props, ref) {
+  return <TerminalInner key={`${props.conn.host.id}\u0000${props.sid}`} {...props} ref={ref} />;
+}));
+
+const styles = StyleSheet.create({
+  wrap: { flex: 1, backgroundColor: "#09090b" },
+  web: { flex: 1, backgroundColor: "#09090b" },
+  inputFrozen: {
+    ...StyleSheet.absoluteFill,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 24,
+    backgroundColor: "rgba(9, 9, 11, 0.58)",
+  },
+  inputFrozenCard: {
+    maxWidth: 340,
+    gap: 12,
+    padding: 16,
+    borderRadius: 12,
+    backgroundColor: "#211d15",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#6b5524",
+  },
+  inputFrozenText: { color: "#F0D798", fontSize: 13, lineHeight: 19, textAlign: "center" },
+  inputFrozenRetry: {
+    alignSelf: "center",
+    paddingHorizontal: 13,
+    paddingVertical: 8,
+    borderRadius: 8,
+    backgroundColor: "#3A5BA8",
+  },
+  inputFrozenRetryPressed: { opacity: 0.7 },
+  inputFrozenRetryText: { color: "#fff", fontSize: 12, fontWeight: "700" },
+});

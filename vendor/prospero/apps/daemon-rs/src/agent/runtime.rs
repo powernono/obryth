@@ -1,0 +1,4281 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
+
+use tokio::sync::{Mutex, MutexGuard, Semaphore, oneshot, watch};
+
+use super::claude::{AdapterEvent, ClaudeTurn, QuestionReply, TurnOptions, spawn_turn};
+use super::codex::CodexTurn;
+use super::deepseek::DeepseekTurn;
+use super::opencode::OpencodeTurn;
+use super::store::{ApprovalPolicy, PermissionMode, QueuedRow};
+use super::*;
+use crate::error::{Error, Result};
+use crate::protocol::*;
+use crate::worker::Database;
+
+/// Bounded structured-agent capacity shared by supervisors and workers.
+///
+/// The crawler shard can host up to 232 pending PSMs. Each PSM keeps a
+/// supervisor session and may have a live stage worker, so the former 128
+/// slots would exhaust before the batch scheduler's own admission limit.
+/// Keep headroom for preflight and other control sessions; Controller budgets
+/// and the daemon request/database semaphores still provide backpressure.
+pub(crate) const MAX_TURNS: usize = 512;
+const CROSS_MODEL_CHECK_LEASE_MILLIS: i64 = 60_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentReportDelivery {
+    Submitted,
+    Queued,
+    Delivered,
+}
+
+fn decode_base64_lenient(input: &str) -> Result<Vec<u8>> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = input.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let mut sextets = [0u8; 4];
+        for (index, byte) in chunk.iter().enumerate() {
+            sextets[index] = value(*byte).ok_or_else(|| Error::Invalid("图片数据无效".into()))?;
+        }
+        match chunk.len() {
+            4 => {
+                out.push((sextets[0] << 2) | (sextets[1] >> 4));
+                out.push((sextets[1] << 4) | (sextets[2] >> 2));
+                out.push((sextets[2] << 6) | sextets[3]);
+            }
+            3 => {
+                out.push((sextets[0] << 2) | (sextets[1] >> 4));
+                out.push((sextets[1] << 4) | (sextets[2] >> 2));
+            }
+            2 => out.push((sextets[0] << 2) | (sextets[1] >> 4)),
+            0 => {}
+            _ => return Err(Error::Invalid("图片数据无效".into())),
+        }
+    }
+    Ok(out)
+}
+
+/// Latest card state carried between card-record rewrites.
+struct CardState {
+    name: String,
+    role: Option<String>,
+    task: Option<String>,
+    created_at: i64,
+    status: String,
+    can_message: bool,
+    summary: String,
+}
+
+/// CLI task ids are only used as opaque keys by the renderer, but timeline
+/// record ids must match `[A-Za-z0-9_-]{1,256}`; normalize defensively.
+fn safe_owner(id: &str) -> String {
+    let mut slug: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if slug.is_empty() {
+        slug.push_str("subagent");
+    }
+    slug.truncate(120);
+    slug
+}
+
+fn clone_timeline_writes(writes: &[TimelineWrite]) -> Vec<TimelineWrite> {
+    writes
+        .iter()
+        .map(|write| TimelineWrite {
+            id: write.id.clone(),
+            turn_id: write.turn_id.clone(),
+            expected_revision: write.expected_revision,
+            body: write.body.clone(),
+            text: write.text.clone(),
+            replace: write.replace,
+            subagent_id: write.subagent_id.clone(),
+        })
+        .collect()
+}
+
+fn attachment_path(
+    data: &Path,
+    session_id: &str,
+    message_id: &str,
+    attachment_id: &str,
+) -> Result<std::path::PathBuf> {
+    crate::database::validate_id(session_id)?;
+    crate::timeline::validate_record_id(message_id)?;
+    crate::timeline::validate_record_id(attachment_id)?;
+    Ok(data
+        .join("attachments")
+        .join(session_id)
+        .join(message_id)
+        .join(attachment_id))
+}
+
+async fn persist_attachment_bytes(
+    data: std::path::PathBuf,
+    session_id: String,
+    message_id: String,
+    refs: Vec<MessageAttachment>,
+    attachments: Vec<AttachmentInput>,
+) -> Result<()> {
+    if attachments.is_empty() {
+        return Ok(());
+    }
+    tokio::task::spawn_blocking(move || {
+        let directory = data.join("attachments").join(&session_id).join(&message_id);
+        std::fs::create_dir_all(&directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        }
+        for (reference, attachment) in refs.into_iter().zip(attachments) {
+            let path = attachment_path(&data, &session_id, &message_id, &reference.id)?;
+            let bytes = decode_base64_lenient(&attachment.data_b64)?;
+            std::fs::write(path, bytes)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| Error::Closed)?
+}
+
+/// Build metadata-only attachment refs for the persisted user record. Ids are
+/// generated by the daemon and bytes are stored in private session files.
+fn attachment_refs(attachments: &[AttachmentInput]) -> Vec<MessageAttachment> {
+    attachments
+        .iter()
+        .map(|attachment| MessageAttachment {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            mime_type: attachment.mime_type.clone(),
+            name: attachment.name.clone(),
+        })
+        .collect()
+}
+
+enum Driver {
+    Claude(ClaudeTurn),
+    Codex(CodexTurn),
+    Deepseek(DeepseekTurn),
+    Opencode(OpencodeTurn),
+}
+
+fn engine_agent(agent: AgentKind, profile: Option<&crate::accounts::ApiProfile>) -> AgentKind {
+    profile
+        .map(crate::accounts::profile::agent_kind)
+        .unwrap_or(agent)
+}
+
+fn account_agent_matches(
+    requested: AgentKind,
+    record: &crate::accounts::managed::ManagedRecord,
+) -> bool {
+    record.agent == requested
+        || record
+            .api_profile
+            .as_ref()
+            .is_some_and(|profile| engine_agent(record.agent, Some(profile)) == requested)
+}
+
+impl Driver {
+    fn take_events(&mut self) -> Option<tokio::sync::mpsc::Receiver<AdapterEvent>> {
+        match self {
+            Driver::Claude(driver) => driver.take_events(),
+            Driver::Codex(driver) => driver.take_events(),
+            Driver::Deepseek(driver) => driver.take_events(),
+            Driver::Opencode(driver) => driver.take_events(),
+        }
+    }
+
+    fn interrupt(&self) {
+        match self {
+            Driver::Claude(driver) => driver.interrupt(),
+            Driver::Codex(driver) => driver.kill(),
+            Driver::Deepseek(driver) => driver.interrupt(),
+            Driver::Opencode(driver) => driver.interrupt(),
+        }
+    }
+
+    async fn steer(&self, text: &str, attachments: &[AttachmentInput]) -> Result<()> {
+        match self {
+            Driver::Claude(driver) => driver.steer(text, attachments).await,
+            Driver::Codex(driver) => {
+                if !attachments.is_empty() {
+                    return Err(Error::Invalid("Codex 同轮引导暂不支持附件".into()));
+                }
+                driver.steer(text).await
+            }
+            Driver::Deepseek(driver) => driver.steer(text, attachments).await,
+            Driver::Opencode(driver) => {
+                if !attachments.is_empty() {
+                    return Err(Error::Invalid(
+                        "OpenCode structured runtime 暂不支持图片附件".into(),
+                    ));
+                }
+                driver.steer(text).await
+            }
+        }
+    }
+
+    async fn compact(&self) -> Result<()> {
+        match self {
+            Driver::Claude(driver) => driver.compact().await,
+            Driver::Codex(driver) => driver.compact().await,
+            Driver::Deepseek(driver) => driver.compact().await,
+            Driver::Opencode(driver) => driver.compact().await,
+        }
+    }
+
+    async fn send_to_subagent(&self, subagent: &str, text: &str) -> Result<()> {
+        match self {
+            Driver::Codex(driver) => driver.send_to_subagent(subagent, text).await,
+            Driver::Claude(_) | Driver::Deepseek(_) | Driver::Opencode(_) => {
+                Err(Error::Invalid("这个 Agent 不支持子 Agent 定向消息".into()))
+            }
+        }
+    }
+
+    async fn read_subagent_history(
+        &self,
+        subagent: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>> {
+        match self {
+            Driver::Codex(driver) => driver.read_subagent_history(subagent).await,
+            Driver::Claude(_) | Driver::Deepseek(_) | Driver::Opencode(_) => Ok(None),
+        }
+    }
+
+    async fn apply_selection(&mut self, model: &str, effort: Option<&str>) -> Result<()> {
+        match self {
+            Driver::Claude(driver) => driver.apply_selection(model, effort).await,
+            Driver::Codex(driver) => driver.apply_selection(model, effort).await,
+            Driver::Deepseek(driver) => driver.apply_selection(model, effort).await,
+            Driver::Opencode(driver) => driver.apply_selection(model).await,
+        }
+    }
+
+    async fn models(&self, workspace: &str) -> Option<Result<AgentModelCatalog>> {
+        match self {
+            Driver::Deepseek(driver) => Some(driver.models().await),
+            Driver::Opencode(driver) => Some(driver.models(workspace).await),
+            Driver::Claude(_) | Driver::Codex(_) => None,
+        }
+    }
+
+    fn kill(&self) {
+        match self {
+            Driver::Claude(driver) => driver.kill(),
+            Driver::Codex(driver) => driver.kill(),
+            Driver::Deepseek(driver) => driver.kill(),
+            Driver::Opencode(driver) => driver.kill(),
+        }
+    }
+}
+
+struct Handle {
+    driver: Mutex<Driver>,
+    replies: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    /// request id -> timeline record id of pending approvals.
+    records: Mutex<HashMap<String, String>>,
+    questions: Mutex<HashMap<String, QuestionPending>>,
+    compact: Mutex<Option<oneshot::Sender<std::result::Result<(), String>>>>,
+    /// Starts true; flipped once the turn's `result` frame has been observed.
+    /// A steer delivered later cannot reach the CLI (its stdin is about to be
+    /// closed), so busy-send/guide degrade to the front of the queue instead
+    /// of trusting a write that the kernel pipe buffer may absorb silently.
+    steerable: AtomicBool,
+}
+
+/// Pending AskUserQuestion: the blocking CLI reply plus the map from public
+/// question ids (`q1`) back to the native question text used in the answer.
+struct QuestionPending {
+    reply: oneshot::Sender<QuestionReply>,
+    native_by_id: HashMap<String, String>,
+}
+
+struct Session {
+    handle: Mutex<Option<Arc<Handle>>>,
+    usage: Mutex<UsageReport>,
+    ended: watch::Sender<()>,
+    /// Serializes drain loops so only the turn that just finished chains the
+    /// queued turns (mirrors the legacy `drainingQueue` guard).
+    draining: Mutex<()>,
+    #[allow(dead_code)]
+    permit: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+struct State {
+    database: Database,
+    entries: Mutex<HashMap<String, Arc<Session>>>,
+    /// Serializes claim + delivery for each parent so a later final fan-in
+    /// cannot overtake an earlier incremental batch.
+    fan_in_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    slots: Arc<Semaphore>,
+    worker_start_scheduler: AtomicBool,
+    closed: AtomicBool,
+    failed: AtomicBool,
+    changed: watch::Sender<u64>,
+    control_environment: std::sync::Mutex<Option<crate::control_cli::ControlEnvironment>>,
+}
+
+fn profile_model_catalog(
+    profile: crate::accounts::ApiProfile,
+    current_effort: Option<String>,
+) -> AgentModelCatalog {
+    let current = profile.model.clone();
+    AgentModelCatalog {
+        models: vec![super::LaunchModelInfo {
+            id: profile.model.clone(),
+            label: profile.model,
+            description: None,
+            supported_efforts: profile
+                .model_capabilities
+                .as_ref()
+                .and_then(|caps| caps.supported_efforts.clone())
+                .unwrap_or_default(),
+            default_effort: None,
+            is_default: true,
+        }],
+        current_model: Some(current),
+        current_effort,
+    }
+}
+
+#[derive(Clone)]
+pub struct Agents(Arc<State>);
+
+impl Agents {
+    pub fn new(database: Database) -> Self {
+        Self(Arc::new(State {
+            database,
+            entries: Mutex::new(HashMap::new()),
+            fan_in_locks: Mutex::new(HashMap::new()),
+            slots: Arc::new(Semaphore::new(MAX_TURNS)),
+            worker_start_scheduler: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            changed: watch::channel(0).0,
+            control_environment: std::sync::Mutex::new(None),
+        }))
+    }
+
+    pub fn count(&self) -> usize {
+        MAX_TURNS - self.0.slots.available_permits()
+    }
+
+    pub(crate) fn changes(&self) -> watch::Sender<u64> {
+        self.0.changed.clone()
+    }
+
+    pub(crate) fn database(&self) -> Database {
+        self.0.database.clone()
+    }
+
+    pub fn configure_control_environment(
+        &self,
+        base_url: String,
+        token_path: PathBuf,
+        socket_path: String,
+        cli_dir: Option<PathBuf>,
+    ) {
+        if let Ok(mut environment) = self.0.control_environment.lock() {
+            *environment = Some(crate::control_cli::ControlEnvironment {
+                home: self.0.database.directory().to_owned(),
+                base_url,
+                token_path,
+                socket_path,
+                cli_dir,
+            });
+        }
+    }
+
+    /// Reconcile cross-model child rows with their independently-persisted
+    /// sessions.  A child can finish before the stream task reaches its
+    /// normal fan-in path (notably when a provider emits `turn/completed`
+    /// and closes immediately).  Without this pass it remains `starting`,
+    /// preventing the parent from ever receiving the batch report.
+    pub async fn recover_cross_model_fan_in_claims(&self) -> Result<usize> {
+        self.0
+            .database
+            .call(|store| store.release_orphaned_cross_model_fan_in_claims())
+            .await
+    }
+
+    /// Retry unclaimed terminal child reports that did not reach their parent.
+    /// Claims without a queue row are released only during startup recovery;
+    /// releasing them while a live delivery is in flight could duplicate it.
+    pub async fn retry_durable_cross_model_fan_in_batch(
+        &self,
+        after_parent: Option<String>,
+        limit: i64,
+    ) -> Result<Option<String>> {
+        let parents = self
+            .0
+            .database
+            .call(move |store| {
+                store.pending_cross_model_fan_in_parents_limit(after_parent.as_deref(), limit)
+            })
+            .await?;
+        let last_parent = parents.last().cloned();
+        for parent_id in parents {
+            match self.deliver_pending_cross_model_fan_in(&parent_id).await {
+                Ok(_) => {}
+                Err(error) => self.0.database.record_recent_error(
+                    "cross_model.fan_in_retry",
+                    "agent_sessions",
+                    &error.public().code,
+                ),
+            }
+        }
+        Ok(last_parent)
+    }
+
+    pub async fn reconcile_cross_model_children(&self) -> Result<usize> {
+        let children = self
+            .0
+            .database
+            .call(|store| store.unsettled_cross_model_children())
+            .await?;
+        let mut settled = 0;
+        for child in children {
+            let child_id = child.session_id.clone();
+            let observed = self
+                .0
+                .database
+                .call(move |store| {
+                    let head = store.session(&child_id)?;
+                    let run = store.agent_run(&child_id)?;
+                    let task_turn = store.cross_model_child_task_turn(&child_id)?;
+                    let summary = store.cross_model_child_summary(&child_id)?;
+                    Ok((head.lifecycle, head.status, run.active, task_turn, summary))
+                })
+                .await?;
+            let (lifecycle, status, active, task_turn, summary) = observed;
+            let terminal = matches!(
+                status,
+                SessionStatus::Idle | SessionStatus::Completed | SessionStatus::Failed
+            ) || lifecycle == SessionLifecycle::Archived
+                || !active;
+            if !terminal {
+                continue;
+            }
+            // Do not archive the child here. A completed structured turn can
+            // legitimately leave its session reusable (and its active run
+            // registered); this reconciliation pass only owns the
+            // cross-model relation and its fan-in report.
+            let result = summary.filter(|text| !text.trim().is_empty()).or_else(|| {
+                (status == SessionStatus::Failed || lifecycle == SessionLifecycle::Archived)
+                    .then_some("子任务运行未生成可用的最终摘要。".into())
+            });
+            let state = if status == SessionStatus::Failed
+                || lifecycle == SessionLifecycle::Archived
+                || result.is_none()
+            {
+                "failed"
+            } else {
+                "completed"
+            };
+            let child_id = child.session_id.clone();
+            let result_for_store = result.clone();
+            let completed = self
+                .0
+                .database
+                .call(move |store| {
+                    store.complete_cross_model_child(
+                        &child_id,
+                        task_turn,
+                        state,
+                        result_for_store.as_deref(),
+                    )
+                })
+                .await?;
+            let summary = completed.result.clone().unwrap_or_else(|| {
+                if state == "completed" {
+                    "子任务已完成，但没有可回传的文本摘要。".into()
+                } else {
+                    "子任务未完成。".into()
+                }
+            });
+            self.write_cross_model_card(&completed, state, bounded_text(summary))
+                .await?;
+            if self
+                .deliver_pending_cross_model_fan_in(&completed.parent_session_id)
+                .await?
+            {
+                settled += 1;
+            }
+        }
+        // A prior delivery can fail after it has claimed the batch. Retry all
+        // durable, fully-terminal batches even when this invocation did not
+        // settle a child itself.
+        let parents = self
+            .0
+            .database
+            .call(|store| store.pending_cross_model_fan_in_parents())
+            .await?;
+        for parent_id in parents {
+            if self.deliver_pending_cross_model_fan_in(&parent_id).await? {
+                settled += 1;
+            }
+        }
+        Ok(settled)
+    }
+
+    async fn deliver_pending_cross_model_fan_in(&self, parent_session_id: &str) -> Result<bool> {
+        let delivery_lock = {
+            let mut locks = self.0.fan_in_locks.lock().await;
+            locks
+                .entry(parent_session_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _delivery = delivery_lock.lock().await;
+        let parent_id = parent_session_id.to_owned();
+        let parent = self
+            .0
+            .database
+            .call(move |store| store.session(&parent_id))
+            .await?;
+        if parent.lifecycle != SessionLifecycle::Active
+            || (parent.kind == SessionKind::Structured
+                && self.session_entry(parent_session_id).await.is_err())
+        {
+            return Ok(false);
+        }
+        let mut delivered = false;
+        loop {
+            let parent_id = parent_session_id.to_owned();
+            let report = self
+                .0
+                .database
+                .call(move |store| store.claim_cross_model_fan_in(&parent_id))
+                .await?;
+            let Some(fan_in) = report else {
+                return Ok(delivered);
+            };
+            let super::store::CrossModelFanIn {
+                report,
+                claim_id,
+                children: claimed_children,
+            } = fan_in;
+            let delivery = self
+                .deliver_cross_model_fan_in(parent_session_id, report, Some(claim_id.clone()))
+                .await;
+            let delivery = match delivery {
+                Ok(delivery) => delivery,
+                Err(error) => {
+                    let parent_id = parent_session_id.to_owned();
+                    let _ = self
+                        .0
+                        .database
+                        .call(move |store| {
+                            store.release_cross_model_fan_in(
+                                &parent_id,
+                                &claim_id,
+                                &claimed_children,
+                            )
+                        })
+                        .await;
+                    return Err(error);
+                }
+            };
+            if delivery == ParentReportDelivery::Submitted {
+                let parent_id = parent_session_id.to_owned();
+                self.0
+                    .database
+                    .call(move |store| {
+                        store.mark_cross_model_fan_in_delivered(&parent_id, &claim_id)
+                    })
+                    .await?;
+            }
+            delivered = true;
+        }
+    }
+
+    /// Return a completed child-batch report to either kind of parent.
+    /// Structured parents use the normal agent message queue; CLI parents
+    /// are hosted PTYs, so their prompt must be written through the durable
+    /// terminal host rather than through `Agents::send`.
+    async fn deliver_cross_model_fan_in(
+        &self,
+        parent_session_id: &str,
+        report: String,
+        cross_model_claim_id: Option<String>,
+    ) -> Result<ParentReportDelivery> {
+        let parent_id = parent_session_id.to_owned();
+        let parent = self
+            .0
+            .database
+            .call(move |store| store.session(&parent_id))
+            .await?;
+        match parent.kind {
+            SessionKind::Structured => {
+                self.send_internal(
+                    parent_session_id,
+                    report,
+                    None,
+                    Vec::new(),
+                    cross_model_claim_id,
+                )
+                .await
+            }
+            SessionKind::Pty => {
+                let directory = self
+                    .0
+                    .database
+                    .directory()
+                    .join("terminal-hosts")
+                    .join(parent_session_id);
+                let host = crate::terminal::host::Host::attach(directory).await?;
+                let chunks = crate::cross_model_tool::terminal_fan_in_chunks(
+                    &report,
+                    crate::terminal::INPUT_BYTES,
+                );
+                let (last, leading) = chunks.split_last().expect("fan-in stream is non-empty");
+                for chunk in leading {
+                    host.input(TerminalInput {
+                        data_b64: BASE64_STANDARD.encode(chunk),
+                    })
+                    .await?;
+                }
+                if let Some(claim_id) = cross_model_claim_id.as_deref() {
+                    self.mark_cross_model_fan_in_delivered(parent_session_id, claim_id)
+                        .await?;
+                }
+                if let Err(error) = host
+                    .input(TerminalInput {
+                        data_b64: BASE64_STANDARD.encode(last),
+                    })
+                    .await
+                {
+                    if let Some(claim_id) = cross_model_claim_id.as_deref() {
+                        self.rollback_cross_model_fan_in_delivery(parent_session_id, claim_id)
+                            .await;
+                    }
+                    return Err(error);
+                }
+                Ok(if cross_model_claim_id.is_some() {
+                    ParentReportDelivery::Delivered
+                } else {
+                    ParentReportDelivery::Submitted
+                })
+            }
+        }
+    }
+
+    pub async fn schedule_cross_model_check(
+        &self,
+        parent_session_id: &str,
+        input: super::ScheduleCrossModelCheck,
+    ) -> Result<super::CrossModelCheck> {
+        crate::database::validate_id(parent_session_id)?;
+        let parent_id = parent_session_id.to_owned();
+        let delay_seconds = input.delay_seconds;
+        let check = self
+            .0
+            .database
+            .call(move |store| store.schedule_cross_model_check(&parent_id, delay_seconds))
+            .await?;
+        self.publish();
+        Ok(check)
+    }
+
+    /// Deliver every due one-shot child status check. Structured parents use
+    /// the ordinary durable queue when busy; PTY parents receive the same
+    /// prompt through their terminal host.
+    pub async fn deliver_due_cross_model_checks(&self) -> Result<usize> {
+        let mut delivered = 0;
+        loop {
+            let claimed = self
+                .0
+                .database
+                .call(|store| store.claim_due_cross_model_check(CROSS_MODEL_CHECK_LEASE_MILLIS))
+                .await?;
+            let Some((check, report)) = claimed else {
+                return Ok(delivered);
+            };
+            if let Err(error) = self
+                .deliver_cross_model_fan_in(&check.parent_session_id, report, None)
+                .await
+            {
+                let check_id = check.id.clone();
+                let _ = self
+                    .0
+                    .database
+                    .call(move |store| store.release_cross_model_check(&check_id))
+                    .await;
+                return Err(error);
+            }
+            let check_id = check.id;
+            self.0
+                .database
+                .call(move |store| store.mark_cross_model_check_delivered(&check_id))
+                .await?;
+            delivered += 1;
+            self.publish();
+        }
+    }
+
+    pub async fn run_cross_model_check_worker(&self, mut stopping: watch::Receiver<bool>) {
+        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut fan_in_ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        fan_in_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut fan_in_cursor = None;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let _ = self.deliver_due_cross_model_checks().await;
+                }
+                _ = fan_in_ticker.tick() => {
+                    if let Ok(next) = self.retry_durable_cross_model_fan_in_batch(fan_in_cursor.clone(), 8).await {
+                        fan_in_cursor = next;
+                    }
+                }
+                changed = stopping.changed() => {
+                    if changed.is_err() || *stopping.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        MAX_TURNS
+    }
+
+    pub(crate) fn claim_worker_start_scheduler(&self) -> bool {
+        !self.0.closed.load(Ordering::Acquire)
+            && self
+                .0
+                .worker_start_scheduler
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    pub(crate) fn release_worker_start_scheduler(&self) {
+        self.0
+            .worker_start_scheduler
+            .store(false, Ordering::Release);
+    }
+
+    pub(crate) fn worker_starts_closed(&self) -> bool {
+        self.0.closed.load(Ordering::Acquire)
+    }
+
+    pub fn closed(&self) -> bool {
+        self.0.closed.load(Ordering::Acquire)
+    }
+
+    pub fn failed(&self) -> bool {
+        self.0.failed.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_failed_for_test(&self) {
+        self.0.failed.store(true, Ordering::Release);
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.closed() || self.failed() {
+            Err(Error::Closed)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn create(&self, input: CreateAgentSession) -> Result<SessionHead> {
+        self.create_inner(input, None).await
+    }
+
+    pub async fn create_with_id(
+        &self,
+        input: CreateAgentSession,
+        id: String,
+    ) -> Result<SessionHead> {
+        crate::database::validate_id(&id)?;
+        self.create_inner(input, Some(id)).await
+    }
+
+    async fn create_inner(
+        &self,
+        input: CreateAgentSession,
+        id: Option<String>,
+    ) -> Result<SessionHead> {
+        crate::database::validate_text(&input.title, 512, false)?;
+        if input.workspace.len() > 4096 || input.workspace.trim().is_empty() {
+            return Err(Error::Invalid("invalid workspace".into()));
+        }
+        if !Path::new(&input.workspace).is_absolute() {
+            return Err(Error::Invalid("workspace must be absolute".into()));
+        }
+        if self.0.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        let workspace = tokio::task::spawn_blocking({
+            let workspace = input.workspace.clone();
+            move || std::fs::canonicalize(workspace)
+        })
+        .await
+        .map_err(|_| Error::Closed)??;
+        if !workspace.is_dir() {
+            return Err(Error::Invalid("workspace is not a directory".into()));
+        }
+        let workspace = workspace
+            .to_str()
+            .ok_or_else(|| Error::Invalid("workspace must be Unicode".into()))?
+            .to_owned();
+        let permit = self.0.slots.clone().try_acquire_owned().map_err(|_| {
+            self.0
+                .database
+                .record_rejection("agent.create", "agent_sessions");
+            self.0.database.record_recent_error(
+                "agent.create",
+                "agent_sessions",
+                "Agent session capacity exhausted",
+            );
+            Error::Backpressure(crate::error::ResourceBackpressure {
+                retry_after_ms: 1000,
+                operation: "agent.create".into(),
+                resource: "agent_sessions".into(),
+                queue_depth: self.count(),
+                queue_capacity: MAX_TURNS,
+                side_effect_committed: Some(false),
+            })
+        })?;
+        let policy = if input.auto_approve {
+            ApprovalPolicy::Auto
+        } else {
+            ApprovalPolicy::Manual
+        };
+        if !matches!(
+            input.agent,
+            crate::protocol::AgentKind::Claude
+                | crate::protocol::AgentKind::Codex
+                | crate::protocol::AgentKind::Deepseek
+                | crate::protocol::AgentKind::Opencode
+        ) {
+            return Err(Error::Invalid(
+                "Agent 暂未接入 Rust structured runtime".into(),
+            ));
+        }
+        if input.agent == crate::protocol::AgentKind::Deepseek && input.account_id.is_some() {
+            return Err(Error::Invalid(
+                "DeepSeek Harness 使用本机 dsh 账号，不支持绑定 Prospero 账号".into(),
+            ));
+        }
+        if input.agent == crate::protocol::AgentKind::Opencode && input.account_id.is_none() {
+            return Err(Error::Invalid(
+                "OpenCode structured runtime 需要 OpenAI Chat Completions API Profile".into(),
+            ));
+        }
+        let mut input = input;
+        if input.agent == crate::protocol::AgentKind::Codex
+            && input.account_id.as_deref() == Some(crate::agent::NATIVE_CODEX_ID)
+        {
+            input.account_id = None;
+        }
+        if input.agent == crate::protocol::AgentKind::Codex {
+            match input.account_id.as_deref() {
+                None | Some(crate::agent::NATIVE_CODEX_ID) => {}
+                Some(account_id) => {
+                    let data = self.0.database.directory().to_owned();
+                    let account_id = account_id.to_owned();
+                    let profile = self
+                        .0
+                        .database
+                        .call_control("agent.create", move |store| {
+                            Ok(store.managed_snapshot_row(&data, &account_id)?.api_profile)
+                        })
+                        .await?;
+                    match profile.as_ref().map(|profile| profile.protocol()) {
+                        Some("openai_responses" | "openai_chat_completions") => {}
+                        _ => {
+                            return Err(Error::Invalid(
+                                "所选账号不支持 Codex structured runtime".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if input.agent == crate::protocol::AgentKind::Opencode {
+            let Some(account_id) = input.account_id.as_deref() else {
+                return Err(Error::Invalid(
+                    "OpenCode structured runtime 需要 OpenAI Chat Completions API Profile".into(),
+                ));
+            };
+            let data = self.0.database.directory().to_owned();
+            let account_id = account_id.to_owned();
+            let profile = self
+                .0
+                .database
+                .call_control("agent.create", move |store| {
+                    Ok(store.managed_snapshot_row(&data, &account_id)?.api_profile)
+                })
+                .await?;
+            match profile.as_ref().map(|profile| profile.protocol()) {
+                Some("openai_chat_completions") => {}
+                _ => {
+                    return Err(Error::Invalid(
+                        "所选账号不支持 OpenCode structured runtime".into(),
+                    ));
+                }
+            }
+        }
+        if let Some(fork) = input.resume.as_ref().and_then(|resume| resume.fork) {
+            if fork {
+                return Err(Error::Conflict);
+            }
+            return Err(Error::Invalid("接回选项无效".into()));
+        }
+        let mut create = CreateAgentSession {
+            agent: input.agent,
+            title: input
+                .resume
+                .as_ref()
+                .and_then(|resume| resume.title.clone())
+                .unwrap_or(input.title),
+            workspace,
+            auto_approve: input.auto_approve,
+            mode: input.mode,
+            model: input.model,
+            effort: input.effort,
+            agent_preset: input.agent_preset,
+            account_id: input.account_id,
+            resume: input.resume,
+        };
+        let database = self.0.database.clone();
+        let data = self.0.database.directory().to_owned();
+        let head = self
+            .0
+            .database
+            .call_control("agent.create", move |store| {
+                if let Some(account_id) = create.account_id.as_deref() {
+                    if let Some(message) =
+                        crate::accounts::source_bound_launch_error(&database, account_id)?
+                    {
+                        return Err(Error::Invalid(message));
+                    }
+                    if account_id != crate::accounts::NATIVE_CLAUDE_ID {
+                        let record = store.managed_snapshot_row(&data, account_id)?;
+                        if let Some(profile) = record.api_profile.as_ref() {
+                            if !account_agent_matches(create.agent, &record) {
+                                return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
+                            }
+                            create.agent = engine_agent(record.agent, Some(profile));
+                            if profile
+                                .model_capabilities
+                                .as_ref()
+                                .and_then(|caps| caps.tools)
+                                == Some(false)
+                            {
+                                return Err(Error::Invalid(
+                                    "模型 Profile 禁用了工具，无法启动 Code Agent".into(),
+                                ));
+                            }
+                        } else if create.agent != crate::protocol::AgentKind::Claude {
+                            return Err(Error::Invalid("所选账号与 Agent 不匹配".into()));
+                        }
+                        let target = crate::accounts::config::ConfigTarget {
+                            account_id: record.id.clone(),
+                            model: record
+                                .api_profile
+                                .as_ref()
+                                .map(|profile| profile.model.clone()),
+                            model_capabilities: record
+                                .api_profile
+                                .as_ref()
+                                .and_then(|profile| profile.model_capabilities.clone()),
+                            active_sessions: 0,
+                        };
+                        let (default_model, default_effort) =
+                            crate::accounts::config::read_defaults(&data, &target)?;
+                        let resuming = create.resume.is_some();
+                        let effective_default_model = target
+                            .model
+                            .clone()
+                            .or_else(|| (!resuming).then_some(default_model).flatten());
+                        let apply_default_effort = !resuming
+                            && create.effort.is_none()
+                            && create
+                                .model
+                                .as_deref()
+                                .map(|model| Some(model) == effective_default_model.as_deref())
+                                .unwrap_or(true);
+                        if create.model.is_none() {
+                            create.model = effective_default_model;
+                        }
+                        if apply_default_effort {
+                            create.effort = default_effort;
+                        }
+                    }
+                }
+                store.create_agent_session_with_id(create, policy, id)
+            })
+            .await?;
+        let (ended, _) = watch::channel(());
+        self.0.entries.lock().await.insert(
+            head.id.clone(),
+            Arc::new(Session {
+                handle: Mutex::new(None),
+                usage: Mutex::new(UsageReport {
+                    windows: Vec::new(),
+                    ..Default::default()
+                }),
+                ended,
+                draining: Mutex::new(()),
+                permit: Mutex::new(Some(permit)),
+            }),
+        );
+        self.publish();
+        Ok(head)
+    }
+
+    /// Start an independent child structured session against a selected model
+    /// source route.  It deliberately owns its own provider account and
+    /// runtime rather than piggybacking on a parent Codex Task thread.
+    pub async fn create_cross_model_child(
+        &self,
+        parent_session_id: &str,
+        input: CreateCrossModelChild,
+    ) -> Result<CrossModelChild> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::accounts::sources::validate_source_id(&input.source_id)?;
+        crate::accounts::sources::validate_source_id(&input.route_id)?;
+        crate::database::validate_text(&input.task, 65_536, false)?;
+        if !matches!(
+            input.agent,
+            AgentKind::Claude | AgentKind::Codex | AgentKind::Opencode
+        ) {
+            return Err(Error::Invalid(
+                "跨模型子任务仅支持 Claude、Codex 或 OpenCode".into(),
+            ));
+        }
+        let data = self.0.database.directory().to_owned();
+        let source_id = input.source_id.clone();
+        let route_id = input.route_id.clone();
+        let revision = input.revision;
+        let agent = input.agent;
+        let (account_id, profile, source_name, route_name) = self
+            .0
+            .database
+            .call(move |store| {
+                let accounts = store.list_managed_accounts(&data)?;
+                let known = accounts
+                    .iter()
+                    .map(|account| account.id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                let account_agents = accounts
+                    .into_iter()
+                    .map(|account| (account.id, account.agent))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let mut sources = crate::accounts::sources::ModelSources::open(&data)?;
+                let source = sources
+                    .list()
+                    .into_iter()
+                    .find(|source| source.id == source_id)
+                    .ok_or(Error::NotFound)?;
+                let route_name = source
+                    .routes
+                    .iter()
+                    .find(|route| route.id == route_id)
+                    .ok_or(Error::NotFound)?
+                    .name
+                    .clone();
+                let source_name = source.name.clone();
+                let outcome = sources.bind(
+                    &source_id,
+                    &route_id,
+                    revision,
+                    Some(agent),
+                    &known,
+                    &account_agents,
+                )?;
+                let (account_id, profile) = match outcome {
+                    crate::accounts::sources::BindOutcome::Existing(account_id) => {
+                        let profile = store
+                            .managed_snapshot_row(&data, &account_id)?
+                            .api_profile
+                            .ok_or(Error::NotFound)?;
+                        (account_id, profile)
+                    }
+                    crate::accounts::sources::BindOutcome::Created {
+                        account_id,
+                        agent,
+                        profile,
+                        name,
+                        secret,
+                    } => {
+                        store.insert_api_profile_account_with_id(
+                            &data,
+                            &account_id,
+                            &name,
+                            agent,
+                            &profile,
+                            &secret,
+                        )?;
+                        (account_id, profile)
+                    }
+                };
+                Ok((account_id, profile, source_name, route_name))
+            })
+            .await?;
+        let title = input
+            .title
+            .unwrap_or_else(|| format!("{} · {}", source_name, route_name));
+        let head = self
+            .create(CreateAgentSession {
+                agent,
+                title,
+                workspace: {
+                    let id = parent_session_id.to_owned();
+                    self.0
+                        .database
+                        .call(move |store| Ok(store.session(&id)?.workspace))
+                        .await?
+                },
+                auto_approve: true,
+                mode: None,
+                model: Some(profile.model.clone()),
+                effort: profile
+                    .model_capabilities
+                    .as_ref()
+                    .and_then(|caps| caps.supported_efforts.as_ref())
+                    .and_then(|values| values.first())
+                    .cloned(),
+                agent_preset: None,
+                account_id: Some(account_id.clone()),
+                resume: None,
+            })
+            .await?;
+        let child = {
+            let child_id = head.id.clone();
+            let parent_id = parent_session_id.to_owned();
+            let task = input.task.clone();
+            let source_id = input.source_id.clone();
+            let route_id = input.route_id.clone();
+            let account_id = account_id.clone();
+            self.0
+                .database
+                .call(move |store| {
+                    store.register_cross_model_child(
+                        &child_id,
+                        &parent_id,
+                        &task,
+                        &source_id,
+                        &route_id,
+                        &account_id,
+                    )
+                })
+                .await?
+        };
+        self.write_cross_model_card(&child, "starting", String::new())
+            .await?;
+        match self.send(&head.id, input.task, None, Vec::new()).await {
+            Ok(()) => {
+                let running = {
+                    let child_id = head.id.clone();
+                    self.0
+                        .database
+                        .call(move |store| store.mark_cross_model_child_running(&child_id))
+                        .await?
+                };
+                self.write_cross_model_card(&running, "running", String::new())
+                    .await?;
+                Ok(running)
+            }
+            Err(error) => {
+                let failed = {
+                    let child_id = head.id.clone();
+                    let message = error.to_string();
+                    self.0
+                        .database
+                        .call(move |store| {
+                            store.complete_cross_model_child(&child_id, 1, "failed", Some(&message))
+                        })
+                        .await
+                };
+                if let Ok(failed) = failed {
+                    let _ = self
+                        .write_cross_model_card(&failed, "failed", bounded_text(error.to_string()))
+                        .await;
+                    let _ = self
+                        .deliver_pending_cross_model_fan_in(&failed.parent_session_id)
+                        .await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Reuse a completed cross-model child session for another turn. The
+    /// native conversation, pinned account, model route and YOLO policy stay
+    /// unchanged; only this new turn participates in the next parent fan-in.
+    pub async fn follow_up_cross_model_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        input: super::FollowUpCrossModelChild,
+    ) -> Result<CrossModelChild> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::database::validate_id(child_session_id)?;
+        crate::database::validate_text(&input.task, 65_536, false)?;
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        let needs_reactivation = self
+            .0
+            .database
+            .call(move |store| store.cross_model_child_needs_reactivation(&parent_id, &child_id))
+            .await?;
+        let permit = if needs_reactivation {
+            Some(self.0.slots.clone().try_acquire_owned().map_err(|_| {
+                self.0
+                    .database
+                    .record_rejection("agent.follow_up", "agent_sessions");
+                Error::Backpressure(crate::error::ResourceBackpressure {
+                    retry_after_ms: 1000,
+                    operation: "agent.follow_up".into(),
+                    resource: "agent_sessions".into(),
+                    queue_depth: self.count(),
+                    queue_capacity: MAX_TURNS,
+                    side_effect_committed: Some(false),
+                })
+            })?)
+        } else {
+            None
+        };
+        if needs_reactivation {
+            let parent_id = parent_session_id.to_owned();
+            let child_id = child_session_id.to_owned();
+            let still_needs_reactivation = self
+                .0
+                .database
+                .call(move |store| {
+                    store.cross_model_child_needs_reactivation(&parent_id, &child_id)
+                })
+                .await?;
+            if !still_needs_reactivation {
+                return Err(Error::Conflict);
+            }
+        }
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        let task = input.task.clone();
+        let (child, reactivated) = self
+            .0
+            .database
+            .call(move |store| store.reopen_cross_model_child(&parent_id, &child_id, &task))
+            .await?;
+        let task_turn = {
+            let child_id = child_session_id.to_owned();
+            self.0
+                .database
+                .call(move |store| store.cross_model_child_task_turn(&child_id))
+                .await?
+        };
+        if reactivated {
+            self.0.entries.lock().await.insert(
+                child_session_id.to_owned(),
+                Arc::new(Session {
+                    handle: Mutex::new(None),
+                    usage: Mutex::new(UsageReport {
+                        windows: Vec::new(),
+                        ..Default::default()
+                    }),
+                    ended: watch::channel(()).0,
+                    draining: Mutex::new(()),
+                    permit: Mutex::new(permit),
+                }),
+            );
+        }
+        let launched = async {
+            self.write_cross_model_card(&child, "starting", String::new())
+                .await?;
+            self.send(child_session_id, input.task, None, Vec::new())
+                .await?;
+            let running = {
+                let child_id = child_session_id.to_owned();
+                self.0
+                    .database
+                    .call(move |store| store.mark_cross_model_child_running(&child_id))
+                    .await?
+            };
+            self.write_cross_model_card(&running, "running", String::new())
+                .await
+        }
+        .await;
+        if let Err(error) = launched {
+            let child_id = child_session_id.to_owned();
+            let message = error.to_string();
+            let failed = self
+                .0
+                .database
+                .call(move |store| {
+                    store.complete_cross_model_child(&child_id, task_turn, "failed", Some(&message))
+                })
+                .await;
+            if let Ok(failed) = failed {
+                let _ = self
+                    .write_cross_model_card(&failed, "failed", bounded_text(error.to_string()))
+                    .await;
+                let _ = self
+                    .deliver_pending_cross_model_fan_in(&failed.parent_session_id)
+                    .await;
+            }
+            return Err(error);
+        }
+        Ok(child)
+    }
+
+    async fn cross_model_child_for_parent(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<CrossModelChild> {
+        crate::database::validate_id(parent_session_id)?;
+        crate::database::validate_id(child_session_id)?;
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        self.0
+            .database
+            .call(move |store| {
+                let child = store.cross_model_child(&child_id)?;
+                if child.parent_session_id != parent_id {
+                    return Err(Error::NotFound);
+                }
+                Ok(child)
+            })
+            .await
+    }
+
+    pub async fn list_cross_model_children(
+        &self,
+        query: CrossModelChildQuery,
+    ) -> Result<CrossModelChildPage> {
+        let parent = query.parent_session_id;
+        let status = query.status;
+        let pending_result = query.pending_result;
+        let items = self
+            .0
+            .database
+            .call(move |store| {
+                store.list_cross_model_children(
+                    parent.as_deref(),
+                    status.as_deref(),
+                    pending_result,
+                )
+            })
+            .await?;
+        Ok(CrossModelChildPage { items })
+    }
+
+    pub async fn cross_model_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<CrossModelChild> {
+        self.cross_model_child_for_parent(parent_session_id, child_session_id)
+            .await
+    }
+
+    pub async fn cross_model_child_logs(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        query: CrossModelChildLogsQuery,
+    ) -> Result<CrossModelChildLogs> {
+        let limit = query.limit.unwrap_or(80);
+        if !(1..=100).contains(&limit) {
+            return Err(Error::Invalid("日志条数必须在 1 到 100 之间".into()));
+        }
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        let (child, events, ev_seq) = self
+            .0
+            .database
+            .call(move |store| {
+                let child = store.cross_model_child(&child_id)?;
+                if child.parent_session_id != parent_id {
+                    return Err(Error::NotFound);
+                }
+                let (events, ev_seq) = store.timeline_events(&child_id, limit)?;
+                Ok((child, events, ev_seq))
+            })
+            .await?;
+        Ok(CrossModelChildLogs {
+            child,
+            events,
+            ev_seq,
+        })
+    }
+
+    pub async fn cross_model_child_result(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<CrossModelChildResult> {
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        let (child, full_result, diffs) = self
+            .0
+            .database
+            .call(move |store| {
+                let child = store.cross_model_child(&child_id)?;
+                if child.parent_session_id != parent_id {
+                    return Err(Error::NotFound);
+                }
+                let full_result = store.cross_model_child_result(&child_id)?;
+                let diffs = store.cross_model_child_diffs(&child_id)?;
+                Ok((child, full_result, diffs))
+            })
+            .await?;
+        let delivered = child.summary_delivered;
+        let acknowledged = child.summary_acknowledged;
+        let result = if full_result.trim().is_empty() {
+            child.result.clone().unwrap_or_default()
+        } else {
+            full_result
+        };
+        Ok(CrossModelChildResult {
+            child,
+            result,
+            diffs,
+            delivered,
+            acknowledged,
+        })
+    }
+
+    pub async fn message_cross_model_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        input: MessageCrossModelChild,
+    ) -> Result<CrossModelChild> {
+        crate::database::validate_text(&input.text, 65_536, false)?;
+        let child = self
+            .cross_model_child_for_parent(parent_session_id, child_session_id)
+            .await?;
+        if !matches!(child.status.as_str(), "starting" | "running") {
+            return Err(Error::Conflict);
+        }
+        let entry = self.session_entry(child_session_id).await?;
+        let guard = entry.handle.lock().await;
+        let handle = guard.as_ref().ok_or(Error::Conflict)?;
+        if !handle.steerable.load(Ordering::Acquire) {
+            return Err(Error::Conflict);
+        }
+        let workspace = {
+            let child_id = child_session_id.to_owned();
+            self.0
+                .database
+                .call(move |store| Ok(store.session(&child_id)?.workspace))
+                .await?
+        };
+        let expanded = self.expand_prompt(&workspace, &input.text).await?;
+        handle.driver.lock().await.steer(&expanded, &[]).await?;
+        drop(guard);
+        self.record_steer(child_session_id, &input.text, &[])
+            .await?;
+        let running = {
+            let child_id = child_session_id.to_owned();
+            self.0
+                .database
+                .call(move |store| store.mark_cross_model_child_running(&child_id))
+                .await?
+        };
+        self.write_cross_model_card(&running, "running", "已向子 Agent 追加要求。".into())
+            .await?;
+        self.publish();
+        Ok(running)
+    }
+
+    pub async fn cancel_cross_model_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        input: CancelCrossModelChild,
+    ) -> Result<CrossModelChild> {
+        let child = self
+            .cross_model_child_for_parent(parent_session_id, child_session_id)
+            .await?;
+        if matches!(child.status.as_str(), "completed" | "failed" | "stopped") {
+            return Ok(child);
+        }
+        let task_turn = {
+            let child_id = child_session_id.to_owned();
+            self.0
+                .database
+                .call(move |store| store.cross_model_child_task_turn(&child_id))
+                .await?
+        };
+        let reason = input
+            .reason
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "子任务已被主会话停止。".into());
+        crate::database::validate_text(&reason, 65_536, false)?;
+        let stopped = {
+            let child_id = child_session_id.to_owned();
+            let reason = reason.clone();
+            self.0
+                .database
+                .call(move |store| {
+                    store.complete_cross_model_child(&child_id, task_turn, "stopped", Some(&reason))
+                })
+                .await?
+        };
+        let _ = self.close(child_session_id).await;
+        self.write_cross_model_card(&stopped, "stopped", bounded_text(reason))
+            .await?;
+        self.deliver_pending_cross_model_fan_in(parent_session_id)
+            .await?;
+        Ok(stopped)
+    }
+
+    pub async fn acknowledge_cross_model_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<CrossModelChild> {
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        let child = self
+            .0
+            .database
+            .call(move |store| store.acknowledge_cross_model_child(&parent_id, &child_id))
+            .await?;
+        self.publish();
+        Ok(child)
+    }
+
+    pub async fn redeliver_cross_model_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<CrossModelChild> {
+        let parent_id = parent_session_id.to_owned();
+        let child_id = child_session_id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.reset_cross_model_delivery(&parent_id, &child_id))
+            .await?;
+        self.deliver_pending_cross_model_fan_in(parent_session_id)
+            .await?;
+        let child = self
+            .cross_model_child_for_parent(parent_session_id, child_session_id)
+            .await?;
+        self.publish();
+        Ok(child)
+    }
+
+    async fn write_cross_model_card(
+        &self,
+        child: &CrossModelChild,
+        status: &str,
+        summary: String,
+    ) -> Result<()> {
+        let parent_id = child.parent_session_id.clone();
+        let child_id = child.session_id.clone();
+        let card_id = format!("cross-child-{child_id}");
+        let task = super::store::cross_model_card_task(&child.task);
+        let source = format!("{} / {}", child.source_id, child.route_id);
+        let created_at = child.created_at;
+        let status = status.to_owned();
+        let can_message = matches!(status.as_str(), "starting" | "running");
+        self.0
+            .database
+            .call(move |store| {
+                let expected_revision = store
+                    .timeline_record(&parent_id, &card_id)
+                    .map(|record| record.revision)
+                    .unwrap_or(0);
+                store.write_timeline(
+                    &parent_id,
+                    TimelineWrite {
+                        id: card_id,
+                        turn_id: format!("cross-{child_id}"),
+                        expected_revision,
+                        body: TimelineBody::Subagent {
+                            subagent_id: child_id,
+                            name: source,
+                            role: Some("跨模型子 Agent · YOLO".into()),
+                            task: Some(task),
+                            status,
+                            can_message,
+                            summary: super::store::cross_model_card_summary(&summary),
+                            created_at,
+                            updated_at: crate::database::now(),
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                )?;
+                Ok(())
+            })
+            .await?;
+        self.publish();
+        Ok(())
+    }
+
+    async fn session_entry(&self, id: &str) -> Result<Arc<Session>> {
+        crate::database::validate_id(id)?;
+        self.0
+            .entries
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or(Error::NotFound)
+    }
+
+    pub async fn send(
+        &self,
+        id: &str,
+        text: String,
+        delivery: Option<String>,
+        attachments: Vec<AttachmentInput>,
+    ) -> Result<()> {
+        self.send_internal(id, text, delivery, attachments, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn send_internal(
+        &self,
+        id: &str,
+        text: String,
+        delivery: Option<String>,
+        attachments: Vec<AttachmentInput>,
+        cross_model_claim_id: Option<String>,
+    ) -> Result<ParentReportDelivery> {
+        validate_message(&text, &attachments)?;
+        let entry = self.session_entry(id).await?;
+        let mut guard = entry.handle.lock().await;
+        let Some(handle) = guard.clone() else {
+            // Idle: start a fresh turn immediately.
+            let claimed = cross_model_claim_id.is_some();
+            let (turn, handle) = self
+                .launch_turn(
+                    id,
+                    text,
+                    attachments,
+                    cross_model_claim_id.as_deref(),
+                    &mut guard,
+                )
+                .await?;
+            self.spawn_chain(id.to_owned(), turn, handle);
+            return Ok(if claimed {
+                ParentReportDelivery::Delivered
+            } else {
+                ParentReportDelivery::Submitted
+            });
+        };
+        // Busy turn: either steer the live CLI or park the message in the
+        // persistent queue for the turn-end drain.
+        let row = QueuedRow {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            kind: if delivery.as_deref() == Some("steer") {
+                "guide"
+            } else {
+                "queue"
+            }
+            .to_owned(),
+            text: text.clone(),
+            created_at: crate::database::now(),
+            attachments,
+            cross_model_claim_id,
+        };
+        let steering = delivery.as_deref() == Some("steer");
+        if steering && handle.steerable.load(Ordering::Acquire) {
+            let workspace = {
+                let id = id.to_owned();
+                self.0
+                    .database
+                    .call(move |store| Ok(store.session(&id)?.workspace))
+                    .await?
+            };
+            let expanded = self.expand_prompt(&workspace, &text).await?;
+            if handle
+                .driver
+                .lock()
+                .await
+                .steer(&expanded, &row.attachments)
+                .await
+                .is_ok()
+            {
+                self.record_steer(id, &text, &row.attachments).await?;
+                self.publish();
+                return Ok(ParentReportDelivery::Submitted);
+            }
+            // The current turn can no longer accept a steer (broken pipe /
+            // result already emitted): degrade to the front of the queue. The
+            // message and its images must not be lost.
+        }
+        self.enqueue(id, &row, steering).await?;
+        Ok(ParentReportDelivery::Queued)
+    }
+
+    async fn enqueue(&self, id: &str, row: &QueuedRow, front: bool) -> Result<()> {
+        let row = row.clone();
+        let id = id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.enqueue_message(&id, &row, front))
+            .await?;
+        self.publish();
+        Ok(())
+    }
+
+    async fn mark_cross_model_fan_in_delivered(
+        &self,
+        parent_session_id: &str,
+        claim_id: &str,
+    ) -> Result<()> {
+        let claim_id = claim_id.to_owned();
+        let parent_id = parent_session_id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.mark_cross_model_fan_in_delivered(&parent_id, &claim_id))
+            .await?;
+        Ok(())
+    }
+
+    async fn release_queued_cross_model_fan_in_claim(
+        &self,
+        parent_session_id: &str,
+        row: &QueuedRow,
+    ) {
+        let Some(claim_id) = row.cross_model_claim_id.clone() else {
+            return;
+        };
+        let parent_id = parent_session_id.to_owned();
+        let _ = self
+            .0
+            .database
+            .call(move |store| store.release_cross_model_fan_in_claim(&parent_id, &claim_id))
+            .await;
+    }
+
+    async fn rollback_cross_model_fan_in_delivery(&self, parent_session_id: &str, claim_id: &str) {
+        let parent_id = parent_session_id.to_owned();
+        let claim_id = claim_id.to_owned();
+        let _ = self
+            .0
+            .database
+            .call(move |store| store.rollback_cross_model_fan_in_delivery(&parent_id, &claim_id))
+            .await;
+    }
+
+    fn retry_pending_cross_model_fan_in(&self, parent_session_id: String) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let _ = runtime
+                .deliver_pending_cross_model_fan_in(&parent_session_id)
+                .await;
+        });
+    }
+
+    /// Persist a successfully-delivered steer as a user message immediately:
+    /// it cannot be unsent, and the audit trail must show it even though no
+    /// queued row exists.
+    async fn record_steer(
+        &self,
+        id: &str,
+        text: &str,
+        attachments: &[AttachmentInput],
+    ) -> Result<()> {
+        let (turn, _native) = {
+            let id = id.to_owned();
+            self.0
+                .database
+                .call(move |store| {
+                    let run = store.agent_run(&id)?;
+                    Ok((run.turn, run.native_id))
+                })
+                .await?
+        };
+        let refs = attachment_refs(attachments);
+        let write = TimelineWrite {
+            id: format!("turn{turn}-steer-{}", uuid::Uuid::new_v4().simple()),
+            turn_id: format!("turn{turn}"),
+            expected_revision: 0,
+            body: TimelineBody::Message {
+                role: MessageRole::User,
+                final_answer: false,
+                attachments: refs.clone(),
+            },
+            text: text.to_owned(),
+            replace: false,
+            subagent_id: None,
+        };
+        persist_attachment_bytes(
+            self.0.database.directory().to_owned(),
+            id.to_owned(),
+            write.id.clone(),
+            refs,
+            attachments.to_vec(),
+        )
+        .await?;
+        let result = self.append_timeline_resilient(id, &[write], None).await;
+        if let Err(error) = &result
+            && !matches!(error, Error::Closed)
+        {
+            self.0.failed.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    async fn expand_prompt(&self, workspace: &str, prompt: &str) -> Result<String> {
+        let workspace = workspace.to_owned();
+        let prompt = prompt.to_owned();
+        tokio::task::spawn_blocking(move || crate::skills::expand_prompt(&workspace, &prompt))
+            .await
+            .map_err(|_| Error::Closed)
+    }
+
+    /// Prepare and spawn one CLI turn, install its handle under `guard`, and
+    /// return the turn number plus the handle. The caller owns chaining (it
+    /// either spawns the chain task or continues the drain loop in place).
+    async fn launch_turn(
+        &self,
+        id: &str,
+        text: String,
+        attachments: Vec<AttachmentInput>,
+        cross_model_claim_id: Option<&str>,
+        guard: &mut MutexGuard<'_, Option<Arc<Handle>>>,
+    ) -> Result<(i64, Arc<Handle>)> {
+        if self.0.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        let run = {
+            let id = id.to_owned();
+            self.0
+                .database
+                .call_control("session.launch", move |store| {
+                    let run = store.agent_run(&id)?;
+                    if !run.active {
+                        return Err(Error::Conflict);
+                    }
+                    Ok(run)
+                })
+                .await?
+        };
+        let (turn, native_id) = {
+            let id = id.to_owned();
+            self.0
+                .database
+                .call_control("session.turn_start", move |store| {
+                    store.begin_agent_turn(&id)
+                })
+                .await?
+        };
+        let workspace = {
+            let id = id.to_owned();
+            self.0
+                .database
+                .call_control("session.launch", move |store| {
+                    Ok(store.session(&id)?.workspace)
+                })
+                .await?
+        };
+        // Expand @file/$skill mentions for the CLI while the stored user
+        // record keeps the original text (mirrors legacy structured-session).
+        let expanded = self.expand_prompt(&workspace, &text).await?;
+        self.set_status(id, SessionStatus::Running).await?;
+        // Persist the user's original message before invoking the provider.
+        let refs = attachment_refs(&attachments);
+        let user_message_id = format!("turn{turn}-user");
+        persist_attachment_bytes(
+            self.0.database.directory().to_owned(),
+            id.to_owned(),
+            user_message_id.clone(),
+            refs.clone(),
+            attachments.clone(),
+        )
+        .await?;
+        let user_write = TimelineWrite {
+            id: user_message_id,
+            turn_id: format!("turn{turn}"),
+            expected_revision: 0,
+            body: TimelineBody::Message {
+                role: MessageRole::User,
+                final_answer: false,
+                attachments: refs,
+            },
+            text,
+            replace: false,
+            subagent_id: None,
+        };
+        if let Err(error) = self
+            .append_timeline_resilient(id, &[user_write], Some("session.launch"))
+            .await
+        {
+            if !matches!(error, Error::Closed) {
+                self.0.failed.store(true, Ordering::Release);
+            }
+            return Err(error);
+        }
+        let api_profile =
+            Self::account_api_profile(&self.0.database, run.account_id.clone()).await?;
+        let mut environment =
+            Self::account_environment(&self.0.database, run.account_id.clone()).await?;
+        if let Ok(control) = self.0.control_environment.lock()
+            && let Some(control) = control.as_ref()
+        {
+            environment.extend(control.vars(Some(id)));
+        }
+        let options = TurnOptions {
+            policy: run.policy,
+            mode: run.mode,
+            model: run.model.clone(),
+            effort: run.effort.clone(),
+            environment,
+            api_profile,
+            agent_preset: run.agent_preset.clone(),
+        };
+        let engine = engine_agent(run.agent, options.api_profile.as_ref());
+        if let Some(claim_id) = cross_model_claim_id {
+            self.mark_cross_model_fan_in_delivered(id, claim_id).await?;
+        }
+        let driver = match match engine {
+            AgentKind::Claude => spawn_turn(
+                &workspace,
+                &expanded,
+                &attachments,
+                native_id.as_deref(),
+                &options,
+            )
+            .map(Driver::Claude),
+            AgentKind::Codex => {
+                if !attachments.is_empty() {
+                    Err(Error::Invalid(
+                        "Codex structured runtime 暂不支持图片附件".into(),
+                    ))
+                } else {
+                    super::codex::spawn_turn(
+                        self.0.database.directory(),
+                        &workspace,
+                        &expanded,
+                        native_id.as_deref(),
+                        &options,
+                    )
+                    .await
+                    .map(Driver::Codex)
+                }
+            }
+            AgentKind::Deepseek => super::deepseek::spawn_turn(
+                &workspace,
+                &expanded,
+                &attachments,
+                native_id.as_deref(),
+                &options,
+            )
+            .await
+            .map(Driver::Deepseek),
+            AgentKind::Opencode => super::opencode::spawn_turn(
+                &workspace,
+                &expanded,
+                &attachments,
+                native_id.as_deref(),
+                &options,
+            )
+            .await
+            .map(Driver::Opencode),
+            _ => Err(Error::Invalid(
+                "Agent 暂未接入 Rust structured runtime".into(),
+            )),
+        } {
+            Ok(driver) => driver,
+            Err(error) => {
+                if let Some(claim_id) = cross_model_claim_id {
+                    self.rollback_cross_model_fan_in_delivery(id, claim_id)
+                        .await;
+                }
+                let message = error.to_string();
+                let terminal = vec![
+                    TimelineWrite {
+                        id: format!("turn{turn}-error"),
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: 0,
+                        body: TimelineBody::Error,
+                        text: bounded_text(message),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                    TimelineWrite {
+                        id: format!("turn{turn}-end"),
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: 0,
+                        body: TimelineBody::TurnEnd {
+                            finish: "failed".into(),
+                            diffs: Vec::new(),
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    },
+                ];
+                if let Err(storage) = self
+                    .append_timeline_resilient(id, &terminal, Some("event.turn_terminal"))
+                    .await
+                    && !matches!(storage, Error::Closed)
+                {
+                    self.0.failed.store(true, Ordering::Release);
+                }
+                if let Err(storage) = self
+                    .finish_turn_status_resilient(id, SessionStatus::Failed)
+                    .await
+                    && !matches!(storage, Error::Closed)
+                {
+                    self.0.failed.store(true, Ordering::Release);
+                }
+                self.publish();
+                return Err(error);
+            }
+        };
+        let handle = Arc::new(Handle {
+            driver: Mutex::new(driver),
+            replies: Mutex::new(HashMap::new()),
+            records: Mutex::new(HashMap::new()),
+            questions: Mutex::new(HashMap::new()),
+            compact: Mutex::new(None),
+            steerable: AtomicBool::new(true),
+        });
+        **guard = Some(handle.clone());
+        Ok((turn, handle))
+    }
+
+    /// Run one turn, then drain queued messages as chained turns, all in a
+    /// single task so only the turn that just finished starts the next one.
+    fn spawn_chain(&self, id: String, first_turn: i64, first_handle: Arc<Handle>) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut turn = first_turn;
+            let mut handle = first_handle;
+            loop {
+                runtime.run_turn(id.clone(), turn, handle.clone()).await;
+                let Ok(entry) = runtime.session_entry(&id).await else {
+                    break;
+                };
+                // Hold the drain lock for the whole pop+launch window so a
+                // concurrent steer/guide/send can't start a duplicate turn.
+                let _drain = entry.draining.lock().await;
+                let mut guard = entry.handle.lock().await;
+                if guard
+                    .as_ref()
+                    .is_some_and(|live| Arc::ptr_eq(live, &handle))
+                {
+                    *guard = None;
+                }
+                entry.ended.send_replace(());
+                runtime.publish();
+                let queued = {
+                    let id = id.clone();
+                    runtime
+                        .0
+                        .database
+                        .call(move |store| store.pop_message(&id))
+                        .await
+                };
+                let Some(row) = queued.unwrap_or(None) else {
+                    break;
+                };
+                match runtime
+                    .launch_turn(
+                        &id,
+                        row.text.clone(),
+                        row.attachments.clone(),
+                        row.cross_model_claim_id.as_deref(),
+                        &mut guard,
+                    )
+                    .await
+                {
+                    Ok((next_turn, next_handle)) => {
+                        turn = next_turn;
+                        handle = next_handle;
+                        // Popping one queue row frees capacity. Retry a fan-in
+                        // that previously rolled back because the queue was
+                        // full; the active handle makes it re-enter at the tail.
+                        runtime.retry_pending_cross_model_fan_in(id.clone());
+                        // Guard drops here; run_turn runs without it, and the
+                        // next loop iteration takes the drain slot again.
+                    }
+                    // Archive raced the pop: the queue was cleared by design
+                    // (user killed the session); do not replay it.
+                    Err(Error::Conflict) | Err(Error::NotFound) => {
+                        runtime
+                            .release_queued_cross_model_fan_in_claim(&id, &row)
+                            .await;
+                        break;
+                    }
+                    Err(Error::Closed) => {
+                        // Daemon shutdown: put the popped row back so a future
+                        // daemon can drain it rather than dropping the text.
+                        if runtime.enqueue(&id, &row, true).await.is_err() {
+                            runtime
+                                .release_queued_cross_model_fan_in_claim(&id, &row)
+                                .await;
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        // Transient failure: keep the message at the front;
+                        // the next user-sent turn drains it on completion.
+                        if runtime.enqueue(&id, &row, true).await.is_err() {
+                            runtime
+                                .release_queued_cross_model_fan_in_claim(&id, &row)
+                                .await;
+                        }
+                        runtime.drain_error(&id, turn, &error.to_string()).await;
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    async fn append_timeline_resilient(
+        &self,
+        id: &str,
+        writes: &[TimelineWrite],
+        control_operation: Option<&str>,
+    ) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        loop {
+            if self.0.closed.load(Ordering::Acquire) || !self.0.database.health().alive {
+                return Err(Error::Closed);
+            }
+            let id = id.to_owned();
+            let batch = clone_timeline_writes(writes);
+            let result = if let Some(operation) = control_operation {
+                self.0
+                    .database
+                    .call_control(operation, move |store| {
+                        store.append_agent_records(&id, batch)
+                    })
+                    .await
+            } else {
+                self.0
+                    .database
+                    .call_background("event.timeline", move |store| {
+                        store.append_agent_records(&id, batch)
+                    })
+                    .await
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(Error::Backpressure(_) | Error::Busy) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn set_native_id_resilient(&self, id: &str, turn: i64, native_id: &str) -> Result<()> {
+        loop {
+            if self.0.closed.load(Ordering::Acquire) || !self.0.database.health().alive {
+                return Err(Error::Closed);
+            }
+            let id = id.to_owned();
+            let native_id = native_id.to_owned();
+            let result = self
+                .0
+                .database
+                .call_control("session.native_id", move |store| {
+                    store.set_agent_native_id(&id, turn, &native_id)
+                })
+                .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(Error::Backpressure(_) | Error::Busy) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn drain_error(&self, id: &str, turn: i64, message: &str) {
+        let write = TimelineWrite {
+            id: format!("turn{turn}-drain-error"),
+            turn_id: format!("turn{turn}"),
+            expected_revision: 0,
+            body: TimelineBody::Error,
+            text: bounded_text(message.to_owned()),
+            replace: false,
+            subagent_id: None,
+        };
+        let _ = self.append_timeline_resilient(id, &[write], None).await;
+        self.publish();
+    }
+
+    /// Kick the drain when a queue mutation happens while no turn is running
+    /// (e.g. guideQueued on an idle session dispatches the row immediately).
+    async fn kick_drain(&self, id: &str) {
+        let Ok(entry) = self.session_entry(id).await else {
+            return;
+        };
+        let runtime = self.clone();
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            let _drain = entry.draining.lock().await;
+            let mut guard = entry.handle.lock().await;
+            if guard.is_some() {
+                return;
+            }
+            let row = match runtime
+                .0
+                .database
+                .call({
+                    let id = id.clone();
+                    move |store| store.pop_message(&id)
+                })
+                .await
+            {
+                Ok(Some(row)) => row,
+                _ => return,
+            };
+            match runtime
+                .launch_turn(
+                    &id,
+                    row.text.clone(),
+                    row.attachments.clone(),
+                    row.cross_model_claim_id.as_deref(),
+                    &mut guard,
+                )
+                .await
+            {
+                Ok((turn, handle)) => {
+                    drop(guard);
+                    runtime.spawn_chain(id.clone(), turn, handle);
+                    runtime.retry_pending_cross_model_fan_in(id.clone());
+                }
+                Err(error) => {
+                    if runtime.enqueue(&id, &row, true).await.is_err() {
+                        runtime
+                            .release_queued_cross_model_fan_in_claim(&id, &row)
+                            .await;
+                    }
+                    runtime.drain_error(&id, 0, &error.to_string()).await;
+                }
+            }
+        });
+    }
+
+    pub async fn compact(&self, id: &str, request_id: &str) -> Result<AgentControlResult> {
+        crate::database::validate_id(id)?;
+        let entry = self.session_entry(id).await?;
+        let handle = entry.handle.lock().await.clone().ok_or(Error::Conflict)?;
+        {
+            let mut waiter = handle.compact.lock().await;
+            if waiter.is_some() {
+                return Err(Error::Backpressure(crate::error::ResourceBackpressure {
+                    retry_after_ms: 1000,
+                    operation: "agent.compact".into(),
+                    resource: "agent_compaction".into(),
+                    queue_depth: 1,
+                    queue_capacity: 1,
+                    side_effect_committed: Some(false),
+                }));
+            }
+            let (sender, receiver) = oneshot::channel();
+            *waiter = Some(sender);
+            drop(waiter);
+            let send_result = handle.driver.lock().await.compact().await;
+            if let Err(error) = send_result {
+                let _ = handle.compact.lock().await.take();
+                return Err(error);
+            }
+            match tokio::time::timeout(Duration::from_secs(180), receiver).await {
+                Ok(Ok(Ok(()))) => Ok(AgentControlResult {
+                    kind: "agent.control.result".into(),
+                    sid: id.to_owned(),
+                    request_id: request_id.chars().take(100).collect(),
+                    action: "compact".into(),
+                    ok: true,
+                    message: None,
+                }),
+                Ok(Ok(Err(message))) => Ok(AgentControlResult {
+                    kind: "agent.control.result".into(),
+                    sid: id.to_owned(),
+                    request_id: request_id.chars().take(100).collect(),
+                    action: "compact".into(),
+                    ok: false,
+                    message: Some(message),
+                }),
+                Ok(Err(_)) => Err(Error::Closed),
+                Err(_) => {
+                    let _ = handle.compact.lock().await.take();
+                    Err(Error::Timeout)
+                }
+            }
+        }
+    }
+
+    async fn run_turn(&self, id: String, turn: i64, handle: Arc<Handle>) {
+        let mut events = {
+            let mut driver = handle.driver.lock().await;
+            match driver.take_events() {
+                Some(events) => events,
+                None => return,
+            }
+        };
+        // Revision counters for streaming records that get rewritten in place.
+        let mut revisions: HashMap<String, i64> = HashMap::new();
+        // The single subagent card per Task-tool subagent is rewritten as
+        // lifecycle frames arrive; keyed by native subagent id.
+        let mut card_revisions: HashMap<String, i64> = HashMap::new();
+        // Card metadata carried across the rewrites (the stored record body is
+        // replaced wholesale on every update).
+        let mut cards: HashMap<String, CardState> = HashMap::new();
+        let mut pending: Vec<TimelineWrite> = Vec::new();
+        let mut native_persisted = false;
+        let mut interrupted = false;
+        let mut failure: Option<String> = None;
+        let mut turn_diffs: Vec<FileDiff> = Vec::new();
+
+        macro_rules! flush {
+            () => {{
+                if !pending.is_empty() {
+                    let result = self.append_timeline_resilient(&id, &pending, None).await;
+                    if let Err(error) = result {
+                        if !matches!(error, Error::Closed) {
+                            self.0.failed.store(true, Ordering::Release);
+                        }
+                        failure = Some(error.to_string());
+                        break;
+                    }
+                    pending.clear();
+                }
+            }};
+        }
+
+        loop {
+            let Some(event) = events.recv().await else {
+                failure.get_or_insert_with(|| "agent stream closed".into());
+                break;
+            };
+            match event {
+                AdapterEvent::NativeId(native_id) => {
+                    if !native_persisted {
+                        if let Err(error) =
+                            self.set_native_id_resilient(&id, turn, &native_id).await
+                        {
+                            if !matches!(error, Error::Closed) {
+                                self.0.failed.store(true, Ordering::Release);
+                            }
+                            failure = Some(error.to_string());
+                            break;
+                        }
+                        native_persisted = true;
+                    }
+                }
+                AdapterEvent::SubagentStarted {
+                    subagent,
+                    name,
+                    role,
+                    task,
+                } => {
+                    let slug = safe_owner(&subagent);
+                    let now = crate::database::now();
+                    cards.insert(
+                        slug.clone(),
+                        CardState {
+                            name: name.clone(),
+                            role: role.clone(),
+                            task: task.clone(),
+                            created_at: now,
+                            status: "starting".into(),
+                            can_message: true,
+                            summary: String::new(),
+                        },
+                    );
+                    pending.push(TimelineWrite {
+                        id: format!("card-{slug}"),
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: 0,
+                        body: TimelineBody::Subagent {
+                            subagent_id: slug.clone(),
+                            name,
+                            role,
+                            task,
+                            status: "starting".into(),
+                            can_message: true,
+                            summary: String::new(),
+                            created_at: now,
+                            updated_at: now,
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    });
+                    card_revisions.insert(slug, 1);
+                    flush!();
+                }
+                AdapterEvent::SubagentUpdate {
+                    subagent,
+                    status,
+                    can_message,
+                    summary,
+                } => {
+                    let slug = safe_owner(&subagent);
+                    // A late progress/notification without a task_started still
+                    // needs a card (matches legacy registerSubagent-on-message).
+                    if !cards.contains_key(&slug) {
+                        let now = crate::database::now();
+                        cards.insert(
+                            slug.clone(),
+                            CardState {
+                                name: String::new(),
+                                role: None,
+                                task: None,
+                                created_at: now,
+                                status: "starting".into(),
+                                can_message: true,
+                                summary: String::new(),
+                            },
+                        );
+                    }
+                    let card = cards.get_mut(&slug).expect("card state inserted above");
+                    card.status = status.to_owned();
+                    card.can_message = can_message;
+                    if let Some(text) = summary {
+                        card.summary = bounded_text(text);
+                    }
+                    let CardState {
+                        name,
+                        role,
+                        task,
+                        created_at,
+                        status: card_status,
+                        can_message: card_can,
+                        summary: card_summary,
+                    } = &*card;
+                    let created = !card_revisions.contains_key(&slug);
+                    let revision = card_revisions.get(&slug).copied().unwrap_or(0);
+                    pending.push(TimelineWrite {
+                        id: format!("card-{slug}"),
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: if created { 0 } else { revision },
+                        body: TimelineBody::Subagent {
+                            subagent_id: slug.clone(),
+                            name: name.clone(),
+                            role: role.clone(),
+                            task: task.clone(),
+                            status: card_status.clone(),
+                            can_message: *card_can,
+                            summary: card_summary.clone(),
+                            created_at: *created_at,
+                            updated_at: crate::database::now(),
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    });
+                    card_revisions.insert(slug.clone(), revision + 1);
+                    flush!();
+                }
+                AdapterEvent::Text { subagent, text } => {
+                    let owner = subagent.map(|value| safe_owner(&value));
+                    let record = match &owner {
+                        Some(slug) => format!("sub-{slug}-turn{turn}-answer"),
+                        None => format!("turn{turn}-answer"),
+                    };
+                    let revision = revisions.get(&record).copied().unwrap_or(0);
+                    pending.push(TimelineWrite {
+                        id: record.clone(),
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: revision,
+                        body: TimelineBody::Message {
+                            role: MessageRole::Assistant,
+                            final_answer: true,
+                            attachments: Vec::new(),
+                        },
+                        text: bounded_text(text),
+                        replace: true,
+                        subagent_id: owner,
+                    });
+                    revisions.insert(record, revision + 1);
+                    flush!();
+                }
+                AdapterEvent::Thinking { subagent, text } => {
+                    let owner = subagent.map(|value| safe_owner(&value));
+                    let record = match &owner {
+                        Some(slug) => format!("sub-{slug}-turn{turn}-reasoning"),
+                        None => format!("turn{turn}-reasoning"),
+                    };
+                    let revision = revisions.get(&record).copied().unwrap_or(0);
+                    pending.push(TimelineWrite {
+                        id: record.clone(),
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: revision,
+                        body: TimelineBody::Reasoning,
+                        text: bounded_text(text),
+                        replace: true,
+                        subagent_id: owner,
+                    });
+                    revisions.insert(record, revision + 1);
+                    flush!();
+                }
+                AdapterEvent::ToolCall {
+                    subagent,
+                    call_id,
+                    name,
+                    summary,
+                    diff,
+                } => {
+                    let owner = subagent.map(|value| safe_owner(&value));
+                    let record = match &owner {
+                        Some(slug) => format!("sub-{slug}-{call_id}"),
+                        None => call_id.clone(),
+                    };
+                    pending.push(TimelineWrite {
+                        id: record.clone(),
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: 0,
+                        body: TimelineBody::Tool {
+                            name,
+                            state: ToolState::Running,
+                            summary,
+                            diff,
+                            has_more: false,
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: owner,
+                    });
+                    revisions.insert(record, 1);
+                    flush!();
+                }
+                AdapterEvent::ToolResult {
+                    subagent,
+                    call_id,
+                    name,
+                    summary,
+                    error,
+                    diff,
+                    has_more,
+                } => {
+                    let owner = subagent.map(|value| safe_owner(&value));
+                    let record = match &owner {
+                        Some(slug) => format!("sub-{slug}-{call_id}"),
+                        None => call_id.clone(),
+                    };
+                    let revision = revisions.get(&record).copied().unwrap_or(1);
+                    pending.push(TimelineWrite {
+                        id: record.clone(),
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: revision,
+                        body: TimelineBody::Tool {
+                            name,
+                            state: if error {
+                                ToolState::Failed
+                            } else {
+                                ToolState::Success
+                            },
+                            summary: String::new(),
+                            diff,
+                            has_more,
+                        },
+                        text: summary,
+                        replace: false,
+                        subagent_id: owner,
+                    });
+                    revisions.insert(record, revision + 1);
+                    flush!();
+                }
+                AdapterEvent::Permission {
+                    subagent,
+                    request_id,
+                    tool,
+                    summary,
+                    reply,
+                } => {
+                    flush!();
+                    // Approvals stay on the main timeline so they can be
+                    // answered there; the subagent id rides along as metadata
+                    // and the detail pane picks them up via body.subagent.
+                    let record_id = format!("turn{turn}-perm-{request_id}");
+                    handle
+                        .replies
+                        .lock()
+                        .await
+                        .insert(request_id.clone(), reply);
+                    handle
+                        .records
+                        .lock()
+                        .await
+                        .insert(request_id.clone(), record_id.clone());
+                    let write = TimelineWrite {
+                        id: record_id,
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: 0,
+                        body: TimelineBody::PermissionRequest {
+                            request_id,
+                            tool,
+                            resolved: false,
+                            subagent,
+                        },
+                        text: summary,
+                        replace: false,
+                        subagent_id: None,
+                    };
+                    if let Err(error) = self.append_timeline_resilient(&id, &[write], None).await {
+                        if !matches!(error, Error::Closed) {
+                            self.0.failed.store(true, Ordering::Release);
+                        }
+                        failure = Some(error.to_string());
+                        break;
+                    }
+                    if let Err(error) = self.set_status(&id, SessionStatus::WaitingPermission).await
+                    {
+                        if !matches!(error, Error::Closed) {
+                            self.0.failed.store(true, Ordering::Release);
+                        }
+                        failure = Some(error.to_string());
+                        break;
+                    }
+                }
+                AdapterEvent::Question {
+                    subagent,
+                    request_id,
+                    questions,
+                    reply,
+                } => {
+                    flush!();
+                    let record_id = format!("turn{turn}-q-{request_id}");
+                    let native_by_id = questions
+                        .iter()
+                        .map(|spec| (spec.id.clone(), spec.native_question.clone()))
+                        .collect::<HashMap<_, _>>();
+                    let payload = questions
+                        .into_iter()
+                        .map(|spec| AgentQuestion {
+                            id: spec.id,
+                            header: spec.header,
+                            question: spec.question,
+                            options: spec
+                                .options
+                                .into_iter()
+                                .map(|option| QuestionOption {
+                                    label: option.label,
+                                    description: option.description,
+                                    preview: option.preview,
+                                })
+                                .collect(),
+                            multi_select: spec.multi_select,
+                            allow_other: true,
+                        })
+                        .collect::<Vec<_>>();
+                    handle.questions.lock().await.insert(
+                        request_id.clone(),
+                        QuestionPending {
+                            reply,
+                            native_by_id,
+                        },
+                    );
+                    // The records map is shared with approvals; the `q:`
+                    // prefix keeps the two request-id spaces apart.
+                    handle
+                        .records
+                        .lock()
+                        .await
+                        .insert(format!("q:{request_id}"), record_id.clone());
+                    let write = TimelineWrite {
+                        id: record_id,
+                        turn_id: format!("turn{turn}"),
+                        expected_revision: 0,
+                        body: TimelineBody::Question {
+                            request_id,
+                            questions: payload,
+                            resolved: false,
+                            subagent,
+                        },
+                        text: String::new(),
+                        replace: false,
+                        subagent_id: None,
+                    };
+                    if let Err(error) = self.append_timeline_resilient(&id, &[write], None).await {
+                        if !matches!(error, Error::Closed) {
+                            self.0.failed.store(true, Ordering::Release);
+                        }
+                        failure = Some(error.to_string());
+                        break;
+                    }
+                    if let Err(error) = self.set_status(&id, SessionStatus::WaitingInput).await {
+                        if !matches!(error, Error::Closed) {
+                            self.0.failed.store(true, Ordering::Release);
+                        }
+                        failure = Some(error.to_string());
+                        break;
+                    }
+                }
+                AdapterEvent::Compact { ok, message } => {
+                    if let Some(waiter) = handle.compact.lock().await.take() {
+                        let _ = waiter.send(if ok { Ok(()) } else { Err(message.clone()) });
+                    }
+                    if ok {
+                        pending.push(TimelineWrite {
+                            id: format!("turn{turn}-compact-{}", uuid::Uuid::new_v4().simple()),
+                            turn_id: format!("turn{turn}"),
+                            expected_revision: 0,
+                            body: TimelineBody::TurnEnd {
+                                finish: "compact".into(),
+                                diffs: Vec::new(),
+                            },
+                            text: String::new(),
+                            replace: false,
+                            subagent_id: None,
+                        });
+                        flush!();
+                    } else {
+                        pending.push(TimelineWrite {
+                            id: format!("turn{turn}-compact-error"),
+                            turn_id: format!("turn{turn}"),
+                            expected_revision: 0,
+                            body: TimelineBody::Error,
+                            text: bounded_text(message),
+                            replace: false,
+                            subagent_id: None,
+                        });
+                        flush!();
+                    }
+                }
+                AdapterEvent::Finish {
+                    interrupted: was_interrupted,
+                    error,
+                    cost_usd,
+                    input_tokens,
+                    output_tokens,
+                    diffs,
+                } => {
+                    handle.steerable.store(false, Ordering::Release);
+                    let has_usage = cost_usd.unwrap_or(0.0) > 0.0
+                        || input_tokens.unwrap_or(0) > 0
+                        || output_tokens.unwrap_or(0) > 0;
+                    if has_usage && let Ok(session) = self.session_entry(&id).await {
+                        let mut usage = session.usage.lock().await;
+                        usage.cost_usd =
+                            Some(usage.cost_usd.unwrap_or(0.0) + cost_usd.unwrap_or(0.0));
+                        usage.input_tokens =
+                            Some(usage.input_tokens.unwrap_or(0) + input_tokens.unwrap_or(0));
+                        usage.output_tokens =
+                            Some(usage.output_tokens.unwrap_or(0) + output_tokens.unwrap_or(0));
+                    }
+                    interrupted = was_interrupted;
+                    turn_diffs = diffs;
+                    failure = error;
+                    break;
+                }
+            }
+        }
+
+        if let Some(waiter) = handle.compact.lock().await.take() {
+            let _ = waiter.send(Err(failure
+                .clone()
+                .unwrap_or_else(|| "Claude 上下文压缩未完成".into())));
+        }
+
+        // Terminal records: error (if any) and the turn end marker.
+        let finish = if interrupted {
+            "interrupted"
+        } else if failure.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
+        let mut terminal = Vec::new();
+        if let Some(message) = &failure {
+            terminal.push(TimelineWrite {
+                id: format!("turn{turn}-error"),
+                turn_id: format!("turn{turn}"),
+                expected_revision: 0,
+                body: TimelineBody::Error,
+                text: bounded_text(message.clone()),
+                replace: false,
+                subagent_id: None,
+            });
+        }
+        terminal.push(TimelineWrite {
+            id: format!("turn{turn}-end"),
+            turn_id: format!("turn{turn}"),
+            expected_revision: 0,
+            body: TimelineBody::TurnEnd {
+                finish: finish.into(),
+                diffs: turn_diffs,
+            },
+            text: String::new(),
+            replace: false,
+            subagent_id: None,
+        });
+        if let Err(error) = self
+            .append_timeline_resilient(&id, &terminal, Some("event.turn_terminal"))
+            .await
+        {
+            if !matches!(error, Error::Closed) {
+                self.0.failed.store(true, Ordering::Release);
+            }
+            return;
+        }
+        let status = if failure.is_some() {
+            SessionStatus::Failed
+        } else {
+            SessionStatus::Idle
+        };
+        // Skip the write (and publish) when the session was archived while the
+        // turn was still running; archival owns the terminal status then.
+        let updated = self.finish_turn_status_resilient(&id, status).await;
+        match updated {
+            Ok(true) => self.publish(),
+            Ok(false) | Err(Error::Closed) => {}
+            Err(_) => {
+                self.0.failed.store(true, Ordering::Release);
+                return;
+            }
+        }
+        // A cross-model child is a full independent session.  Once its first
+        // assigned task settles, persist its outcome and rewrite the parent
+        // card with a bounded final answer (or the concrete failure).
+        let child = {
+            let id = id.clone();
+            self.0
+                .database
+                .call(move |store| store.cross_model_child(&id))
+                .await
+        };
+        if let Ok(existing) = child {
+            let task_turn = {
+                let id = id.clone();
+                self.0
+                    .database
+                    .call(move |store| store.cross_model_child_task_turn(&id))
+                    .await
+            };
+            let Ok(task_turn) = task_turn else {
+                return;
+            };
+            if task_turn != turn {
+                return;
+            }
+            let result = if let Some(error) = failure {
+                Some(bounded_text(error))
+            } else {
+                let id = id.clone();
+                self.0
+                    .database
+                    .call(move |store| store.cross_model_child_summary(&id))
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            let state = if result.as_deref().is_some_and(|value| !value.is_empty())
+                && finish == "completed"
+            {
+                "completed"
+            } else if finish == "interrupted" {
+                "stopped"
+            } else {
+                "failed"
+            };
+            let completed = {
+                let id = id.clone();
+                let result = result.clone();
+                self.0
+                    .database
+                    .call(move |store| {
+                        store.complete_cross_model_child(&id, task_turn, state, result.as_deref())
+                    })
+                    .await
+            };
+            if let Ok(completed) = completed {
+                let card_status = completed.status.clone();
+                let summary = completed.result.clone().unwrap_or_else(|| {
+                    if card_status == "completed" {
+                        "子任务已完成，没有可回传的文本摘要。".into()
+                    } else {
+                        "子任务未完成。".into()
+                    }
+                });
+                let _ = self
+                    .write_cross_model_card(&completed, &card_status, bounded_text(summary))
+                    .await;
+                // Structured parents are queued/resumed through Agents;
+                // hosted CLI parents receive identical text as PTY input.
+                // A failed delivery releases its claim for startup recovery.
+                let _ = self
+                    .deliver_pending_cross_model_fan_in(&completed.parent_session_id)
+                    .await;
+            } else {
+                let _ = existing;
+            }
+        }
+    }
+
+    async fn set_status(&self, id: &str, status: SessionStatus) -> Result<SessionHead> {
+        let head = loop {
+            if self.0.closed.load(Ordering::Acquire) || !self.0.database.health().alive {
+                return Err(Error::Closed);
+            }
+            let result = self
+                .0
+                .database
+                .call_control("session.status", {
+                    let id = id.to_owned();
+                    move |store| {
+                        let head = store.session(&id)?;
+                        if head.lifecycle == SessionLifecycle::Archived {
+                            return Err(Error::Closed);
+                        }
+                        store.update_session(
+                            &id,
+                            UpdateSession {
+                                revision: head.revision,
+                                title: None,
+                                lifecycle: None,
+                                status: Some(status),
+                            },
+                        )
+                    }
+                })
+                .await;
+            match result {
+                Ok(head) => break head,
+                Err(Error::Backpressure(_) | Error::Busy) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        self.publish();
+        Ok(head)
+    }
+
+    async fn finish_turn_status_resilient(&self, id: &str, status: SessionStatus) -> Result<bool> {
+        loop {
+            if self.0.closed.load(Ordering::Acquire) || !self.0.database.health().alive {
+                return Err(Error::Closed);
+            }
+            let id = id.to_owned();
+            let result = self
+                .0
+                .database
+                .call_control("session.turn_finish", move |store| {
+                    store.finish_agent_turn_status(&id, status)
+                })
+                .await;
+            match result {
+                Ok(updated) => return Ok(updated),
+                Err(Error::Backpressure(_) | Error::Busy) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn publish(&self) {
+        self.0.changed.send_modify(|seq| *seq = seq.wrapping_add(1));
+    }
+
+    pub async fn respond_permission(&self, id: &str, request_id: &str, allow: bool) -> Result<()> {
+        crate::database::validate_id(request_id)?;
+        let entry = self.session_entry(id).await?;
+        let guard = entry.handle.lock().await;
+        let handle = guard.as_ref().ok_or(Error::NotFound)?;
+        let reply = handle
+            .replies
+            .lock()
+            .await
+            .remove(request_id)
+            .ok_or(Error::NotFound)?;
+        let record_id = handle.records.lock().await.remove(request_id);
+        // The translator's reply task owns the control_response frame.
+        let _ = reply.send(allow);
+        drop(guard);
+        if let Some(record_id) = record_id {
+            let id = id.to_owned();
+            let result = self
+                .0
+                .database
+                .call(move |store| store.resolve_agent_permission(&id, &record_id))
+                .await;
+            // A concurrently-archived session makes the record update moot.
+            if !matches!(result, Err(Error::NotFound)) {
+                result?;
+            }
+        }
+        self.set_status(id, SessionStatus::Running).await?;
+        Ok(())
+    }
+
+    pub async fn respond_question(
+        &self,
+        id: &str,
+        request_id: &str,
+        answers: Vec<QuestionAnswer>,
+        cancelled: bool,
+    ) -> Result<()> {
+        crate::database::validate_id(request_id)?;
+        for answer in &answers {
+            crate::database::validate_id(&answer.question_id)?;
+            if answer.values.iter().any(|value| value.len() > 8192) {
+                return Err(Error::Invalid("answer exceeds limit".into()));
+            }
+        }
+        let entry = self.session_entry(id).await?;
+        let guard = entry.handle.lock().await;
+        let handle = guard.as_ref().ok_or(Error::NotFound)?;
+        let pending = handle
+            .questions
+            .lock()
+            .await
+            .remove(request_id)
+            .ok_or(Error::NotFound)?;
+        let record_id = handle
+            .records
+            .lock()
+            .await
+            .get(&format!("q:{request_id}"))
+            .cloned();
+        let native = answers
+            .into_iter()
+            .filter_map(|answer| {
+                pending
+                    .native_by_id
+                    .get(&answer.question_id)
+                    .map(|native| (native.clone(), answer.values.join(", ")))
+            })
+            .collect::<HashMap<_, _>>();
+        // Dropping would deny; an explicit cancel still allows with {}.
+        let _ = pending.reply.send(QuestionReply {
+            answers: native,
+            cancelled,
+        });
+        drop(guard);
+        if let Some(record_id) = record_id {
+            let id = id.to_owned();
+            let result = self
+                .0
+                .database
+                .call(move |store| store.resolve_agent_question(&id, &record_id))
+                .await;
+            if !matches!(result, Err(Error::NotFound)) {
+                result?;
+            }
+        }
+        self.set_status(id, SessionStatus::Running).await?;
+        Ok(())
+    }
+
+    /// Pending messages for one session (desktop "待发送" list).
+    pub async fn queue(&self, id: &str) -> Result<Vec<QueuedMessage>> {
+        crate::database::validate_id(id)?;
+        let id = id.to_owned();
+        let rows = self
+            .0
+            .database
+            .call(move |store| store.message_queue(&id))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| QueuedMessage {
+                id: row.id,
+                text: row.text,
+                kind: row.kind,
+                created_at: row.created_at,
+                attachment_count: row.attachments.len(),
+            })
+            .collect())
+    }
+
+    /// Non-empty queues across all active sessions (session-list projection).
+    pub async fn queues(&self) -> Result<AgentQueues> {
+        let rows = self.0.database.call(|store| store.message_queues()).await?;
+        Ok(AgentQueues {
+            queues: rows
+                .into_iter()
+                .map(|(session_id, items)| AgentQueue {
+                    session_id,
+                    items: items
+                        .into_iter()
+                        .map(|row| QueuedMessage {
+                            id: row.id,
+                            text: row.text,
+                            kind: row.kind,
+                            created_at: row.created_at,
+                            attachment_count: row.attachments.len(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Cancel a message that has not been dispatched yet. A steer that was
+    /// already delivered has no queue row and cannot be withdrawn.
+    pub async fn remove_queued(&self, id: &str, queue_id: &str) -> Result<()> {
+        let parent_id = id.to_owned();
+        let id = id.to_owned();
+        let queue_id = queue_id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.remove_message(&id, &queue_id))
+            .await?;
+        self.publish();
+        // Removing any row frees a slot; removing a fan-in row also releases
+        // its durable claim in the same database transaction.
+        self.retry_pending_cross_model_fan_in(parent_id);
+        Ok(())
+    }
+
+    /// Upgrade a queued message into a live steer. When the current turn
+    /// cannot accept it (idle, or the CLI pipe is gone) the row moves to the
+    /// front of the queue and is dispatched first on the next drain; the
+    /// message text is never lost.
+    pub async fn guide_queued(&self, id: &str, queue_id: &str) -> Result<()> {
+        crate::database::validate_id(queue_id)?;
+        let entry = self.session_entry(id).await?;
+        let row = {
+            let id = id.to_owned();
+            let queue_id = queue_id.to_owned();
+            let items = self
+                .0
+                .database
+                .call(move |store| store.message_queue(&id))
+                .await?;
+            items
+                .into_iter()
+                .find(|item| item.id == queue_id)
+                .ok_or(Error::NotFound)?
+        };
+        if row.cross_model_claim_id.is_some() {
+            // Internal fan-in reports must start a distinct parent turn so the
+            // durable claim can be completed exactly at that boundary.
+            return Err(Error::Conflict);
+        }
+        let mut steered = false;
+        let guard = entry.handle.lock().await;
+        if let Some(handle) = guard.as_ref()
+            && handle.steerable.load(Ordering::Acquire)
+        {
+            let workspace = {
+                let id = id.to_owned();
+                self.0
+                    .database
+                    .call(move |store| Ok(store.session(&id)?.workspace))
+                    .await?
+            };
+            let expanded = self.expand_prompt(&workspace, &row.text).await?;
+            if handle
+                .driver
+                .lock()
+                .await
+                .steer(&expanded, &row.attachments)
+                .await
+                .is_ok()
+            {
+                steered = true;
+            }
+        }
+        drop(guard);
+        if steered {
+            // The steer reached the CLI: delete the row and audit the message.
+            let removed_id = id.to_owned();
+            let removed_qid = queue_id.to_owned();
+            let removed = self
+                .0
+                .database
+                .call(move |store| store.remove_message(&removed_id, &removed_qid))
+                .await;
+            if matches!(removed, Err(Error::NotFound)) {
+                // A concurrent removal (other client) still must record the
+                // text that was already steered into the CLI.
+            } else {
+                removed?;
+            }
+            self.record_steer(id, &row.text, &row.attachments).await?;
+            self.publish();
+            self.retry_pending_cross_model_fan_in(id.to_owned());
+            return Ok(());
+        }
+        // Not steered: mark guide and move to the front, then kick the drain
+        // in case the turn ended while we were trying.
+        let guided_id = id.to_owned();
+        let guided_qid = queue_id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.guide_message(&guided_id, &guided_qid))
+            .await?;
+        self.publish();
+        drop(entry);
+        self.kick_drain(id).await;
+        Ok(())
+    }
+
+    /// Fetch the launch model catalog by speaking the CLI's headless
+    /// `initialize` handshake (no user turn runs). Every request probes the
+    /// CLI fresh, matching the legacy node adapter.
+    pub async fn launch_catalog() -> Result<LaunchModelCatalog> {
+        let models = super::claude::fetch_launch_catalog(&[]).await?;
+        let current_model = models.first().map(|model| model.id.clone());
+        Ok(LaunchModelCatalog {
+            models,
+            current_model,
+            current_effort: None,
+            presets: Vec::new(),
+            current_preset: None,
+        })
+    }
+
+    pub async fn deepseek_launch_catalog() -> Result<LaunchModelCatalog> {
+        super::deepseek::launch_catalog().await
+    }
+
+    pub async fn opencode_launch_catalog() -> Result<LaunchModelCatalog> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        super::opencode::launch_catalog(Path::new(&home)).await
+    }
+
+    /// Catalog for a specific account: managed accounts probe through their
+    /// isolated config root, so the directory reflects their own identity.
+    pub async fn launch_catalog_for(&self, account_id: Option<&str>) -> Result<LaunchModelCatalog> {
+        let account_id = match account_id {
+            None | Some(crate::accounts::NATIVE_CLAUDE_ID) => None,
+            Some(id) => {
+                crate::database::validate_id(id)?;
+                let id_owned = id.to_owned();
+                self.0
+                    .database
+                    .call(move |store| Ok(store.managed_account(&id_owned)?.id))
+                    .await?;
+                Some(id.to_owned())
+            }
+        };
+        let environment = Self::account_environment(&self.0.database, account_id.clone()).await?;
+        // Profile accounts pin exactly one model through the profile itself;
+        // never spawn the headless CLI catalog probe against their gateway.
+        if let Some(id) = account_id.as_deref() {
+            let data = self.0.database.directory().to_owned();
+            let id = id.to_owned();
+            let profile = self
+                .0
+                .database
+                .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
+                .await?;
+            if let Some(profile) = profile {
+                let efforts = profile
+                    .model_capabilities
+                    .as_ref()
+                    .and_then(|caps| caps.supported_efforts.clone())
+                    .unwrap_or_default();
+                let model = profile.model.clone();
+                return Ok(LaunchModelCatalog {
+                    models: vec![LaunchModelInfo {
+                        id: model,
+                        label: profile.model.clone(),
+                        description: None,
+                        supported_efforts: efforts,
+                        default_effort: None,
+                        is_default: true,
+                    }],
+                    current_model: Some(profile.model),
+                    current_effort: None,
+                    presets: Vec::new(),
+                    current_preset: None,
+                });
+            }
+        }
+        let models = super::claude::fetch_launch_catalog(&environment).await?;
+        let current_model = models.first().map(|model| model.id.clone());
+        Ok(LaunchModelCatalog {
+            models,
+            current_model,
+            current_effort: None,
+            presets: Vec::new(),
+            current_preset: None,
+        })
+    }
+
+    async fn account_api_profile(
+        database: &crate::worker::Database,
+        account_id: Option<String>,
+    ) -> Result<Option<crate::accounts::ApiProfile>> {
+        let Some(id) = account_id else {
+            return Ok(None);
+        };
+        let data = database.directory().to_owned();
+        database
+            .call_control("session.account_profile", move |store| {
+                Ok(store.managed_snapshot_row(&data, &id)?.api_profile)
+            })
+            .await
+    }
+
+    /// Private environment overrides for a session's bound account (empty for
+    /// the native environment). Profile accounts get the isolated API-key
+    /// profile environment; legacy managed accounts the OAuth/imported-key one.
+    /// Credential files are read off the async pool.
+    async fn account_environment(
+        database: &crate::worker::Database,
+        account_id: Option<String>,
+    ) -> Result<Vec<(String, String)>> {
+        let Some(id) = account_id else {
+            return Ok(Vec::new());
+        };
+        let data = database.directory().to_owned();
+        let record = database
+            .call_control("session.account_environment", {
+                let data = data.clone();
+                let id = id.clone();
+                move |store| store.managed_snapshot_row(&data, &id)
+            })
+            .await?;
+        tokio::task::spawn_blocking(move || match record.api_profile {
+            Some(profile) => crate::accounts::managed::profile_account_environment(
+                &data,
+                &record.id,
+                record.agent,
+                &profile,
+            ),
+            None => crate::accounts::managed::claude_environment(&data, &record.id, false),
+        })
+        .await
+        .map_err(|_| Error::Closed)?
+    }
+
+    pub async fn usage(&self, id: &str) -> Result<Option<UsageReport>> {
+        let entry = self.session_entry(id).await?;
+        let report = entry.usage.lock().await.clone();
+        if report.cost_usd.unwrap_or(0.0) == 0.0
+            && report.input_tokens.unwrap_or(0) == 0
+            && report.output_tokens.unwrap_or(0) == 0
+            && report.windows.is_empty()
+            && report.subscription.is_none()
+        {
+            Ok(None)
+        } else {
+            Ok(Some(report))
+        }
+    }
+
+    pub async fn account_usage(&self) -> Result<Vec<UsageAccount>> {
+        let snapshot = crate::accounts::list_accounts(&self.0.database, "usage").await?;
+        let mut sessions = Vec::new();
+        for (id, entry) in self.0.entries.lock().await.iter() {
+            let run = self
+                .0
+                .database
+                .call({
+                    let id = id.clone();
+                    move |store| store.agent_run(&id)
+                })
+                .await?;
+            sessions.push((run.account_id, run.agent, entry.clone()));
+        }
+        let mut accounts = Vec::new();
+        for account in snapshot
+            .accounts
+            .into_iter()
+            .filter(|row| row.status != crate::accounts::AccountStatus::Unavailable)
+        {
+            let live = sessions.iter().find(|(account_id, agent, _)| {
+                *agent == account.agent
+                    && (account_id.as_deref() == Some(account.id.as_str())
+                        || (account_id.is_none() && !account.managed))
+            });
+            let report = if let Some((_, _, entry)) = live {
+                let report = entry.usage.lock().await.clone();
+                (report.cost_usd.unwrap_or(0.0) > 0.0
+                    || report.input_tokens.unwrap_or(0) > 0
+                    || report.output_tokens.unwrap_or(0) > 0
+                    || !report.windows.is_empty()
+                    || report.subscription.is_some())
+                .then_some(report)
+            } else {
+                None
+            };
+            let source = if account.api_profile.is_some()
+                || account
+                    .auth_method
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("api"))
+            {
+                "api"
+            } else if report
+                .as_ref()
+                .and_then(|value| value.subscription.as_ref())
+                .is_some()
+                || account.status == crate::accounts::AccountStatus::SignedIn
+            {
+                "subscription"
+            } else {
+                "unknown"
+            }
+            .to_owned();
+            let available = report.is_some() || source == "api";
+            let reason = if report.is_none() {
+                Some(
+                    if source == "api" {
+                        "API 模型由服务商按 API 用量计费，不提供订阅窗口。"
+                    } else {
+                        "暂时读不到账号额度，请确认 CLI 已登录并刷新。"
+                    }
+                    .into(),
+                )
+            } else if report
+                .as_ref()
+                .is_some_and(|value| value.windows.is_empty())
+            {
+                Some("这个后端不提供套餐限流窗口。".into())
+            } else {
+                None
+            };
+            accounts.push(UsageAccount {
+                agent: account.agent,
+                account_id: Some(account.id),
+                account_name: Some(account.name),
+                source: Some(source),
+                available,
+                report: report.unwrap_or_else(|| UsageReport {
+                    windows: Vec::new(),
+                    ..Default::default()
+                }),
+                reason,
+            });
+        }
+        match super::usage::read_native_codex_usage(self.0.database.directory()).await {
+            Ok(Some(report)) => {
+                accounts.push(UsageAccount {
+                    agent: crate::protocol::AgentKind::Codex,
+                    account_id: Some(super::usage::NATIVE_CODEX_ID.into()),
+                    account_name: Some("本机默认".into()),
+                    source: Some("subscription".into()),
+                    available: true,
+                    reason: if report.windows.is_empty() {
+                        Some("这个后端不提供套餐限流窗口。".into())
+                    } else {
+                        None
+                    },
+                    report,
+                });
+            }
+            Ok(None) => {
+                accounts.push(UsageAccount {
+                    agent: crate::protocol::AgentKind::Codex,
+                    account_id: Some(super::usage::NATIVE_CODEX_ID.into()),
+                    account_name: Some("本机默认".into()),
+                    source: Some("unknown".into()),
+                    available: false,
+                    report: UsageReport {
+                        windows: Vec::new(),
+                        ..Default::default()
+                    },
+                    reason: Some("暂时读不到账号额度，请确认 Codex CLI 已登录并刷新。".into()),
+                });
+            }
+            Err(Error::Feature(code, _)) if code == "agent_unavailable" => {}
+            Err(_) => {
+                accounts.push(UsageAccount {
+                    agent: crate::protocol::AgentKind::Codex,
+                    account_id: Some(super::usage::NATIVE_CODEX_ID.into()),
+                    account_name: Some("本机默认".into()),
+                    source: Some("unknown".into()),
+                    available: false,
+                    report: UsageReport {
+                        windows: Vec::new(),
+                        ..Default::default()
+                    },
+                    reason: Some("暂时读不到账号额度，请确认 Codex CLI 已登录并刷新。".into()),
+                });
+            }
+        }
+        accounts.sort_by(|a, b| {
+            let score = |account: &UsageAccount| -> f64 {
+                if !account.available {
+                    return -1.0;
+                }
+                account
+                    .report
+                    .windows
+                    .iter()
+                    .map(|window| window.utilization)
+                    .fold(0.0, f64::max)
+            };
+            score(b)
+                .partial_cmp(&score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(accounts)
+    }
+
+    /// Current collaboration mode (`default`/`plan`).
+    pub async fn mode(&self, id: &str) -> Result<PermissionMode> {
+        let id = id.to_owned();
+        self.0
+            .database
+            .call(move |store| Ok(store.agent_run(&id)?.mode))
+            .await
+    }
+
+    pub async fn set_approval_policy(&self, id: &str, policy: ApprovalPolicy) -> Result<()> {
+        let id = id.to_owned();
+        self.0
+            .database
+            .call({
+                let id = id.clone();
+                move |store| store.set_approval_policy(&id, policy)
+            })
+            .await?;
+        if policy == ApprovalPolicy::Auto
+            && let Ok(entry) = self.session_entry(&id).await
+        {
+            let pending = {
+                let guard = entry.handle.lock().await;
+                if let Some(handle) = guard.as_ref() {
+                    let replies = std::mem::take(&mut *handle.replies.lock().await);
+                    let mut records = handle.records.lock().await;
+                    let has_questions = !handle.questions.lock().await.is_empty();
+                    replies
+                        .into_iter()
+                        .map(|(request_id, reply)| (reply, records.remove(&request_id)))
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|pending| (pending, has_questions))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
+            };
+            let resolved_any = !pending.is_empty();
+            let has_questions = pending
+                .first()
+                .map(|(_, has_questions)| *has_questions)
+                .unwrap_or(false);
+            for ((reply, record_id), _) in pending {
+                let _ = reply.send(true);
+                if let Some(record_id) = record_id {
+                    let result = self
+                        .0
+                        .database
+                        .call({
+                            let id = id.clone();
+                            move |store| store.resolve_agent_permission(&id, &record_id)
+                        })
+                        .await;
+                    if !matches!(result, Err(Error::NotFound)) {
+                        result?;
+                    }
+                }
+            }
+            if resolved_any {
+                self.set_status(
+                    &id,
+                    if has_questions {
+                        SessionStatus::WaitingInput
+                    } else {
+                        SessionStatus::Running
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+        self.publish();
+        Ok(())
+    }
+
+    /// Switch the collaboration mode. The change applies to the next turn;
+    /// a turn already running keeps the mode it started with.
+    pub async fn set_mode(&self, id: &str, mode: PermissionMode) -> Result<()> {
+        let id = id.to_owned();
+        self.0
+            .database
+            .call(move |store| store.set_agent_mode(&id, mode))
+            .await?;
+        self.publish();
+        Ok(())
+    }
+
+    /// In-session model catalog. The catalog itself comes fresh from the
+    /// headless `initialize` handshake; currentModel/currentEffort are the
+    /// session's persisted selection.
+    pub async fn models(&self, id: &str) -> Result<AgentModelCatalog> {
+        let id = id.to_owned();
+        let id_for_run = id.clone();
+        let run = self
+            .0
+            .database
+            .call(move |store| store.agent_run(&id_for_run))
+            .await?;
+        if !run.active {
+            return Err(Error::Conflict);
+        }
+        if run.agent == AgentKind::Deepseek {
+            let workspace = {
+                let id = id.clone();
+                self.0
+                    .database
+                    .call(move |store| Ok(store.session(&id)?.workspace))
+                    .await?
+            };
+            if let Ok(entry) = self.session_entry(&id).await {
+                let guard = entry.handle.lock().await;
+                if let Some(handle) = guard.as_ref()
+                    && let Some(catalog) = handle.driver.lock().await.models(&workspace).await
+                {
+                    return catalog;
+                }
+            }
+            if run.agent == AgentKind::Deepseek {
+                return super::deepseek::session_catalog(
+                    &workspace,
+                    run.native_id.as_deref(),
+                    run.model.as_deref(),
+                    run.effort.as_deref(),
+                )
+                .await;
+            }
+        }
+        let environment =
+            Self::account_environment(&self.0.database, run.account_id.clone()).await?;
+        // Profile sessions expose the pinned model only.
+        if let Some(id) = run.account_id.as_deref() {
+            let data = self.0.database.directory().to_owned();
+            let id = id.to_owned();
+            let profile = self
+                .0
+                .database
+                .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
+                .await?;
+            if let Some(profile) = profile {
+                return Ok(profile_model_catalog(profile, run.effort));
+            }
+        }
+        if run.agent == AgentKind::Opencode {
+            let workspace = {
+                let id = id.clone();
+                self.0
+                    .database
+                    .call(move |store| Ok(store.session(&id)?.workspace))
+                    .await?
+            };
+            if let Ok(entry) = self.session_entry(&id).await {
+                let guard = entry.handle.lock().await;
+                if let Some(handle) = guard.as_ref()
+                    && let Some(catalog) = handle.driver.lock().await.models(&workspace).await
+                {
+                    return catalog;
+                }
+            }
+        }
+        let models = if run.agent == AgentKind::Codex {
+            super::usage::read_native_codex_models(self.0.database.directory())
+                .await?
+                .models
+        } else {
+            super::claude::fetch_launch_catalog(&environment).await?
+        };
+        let current_model = run
+            .model
+            .or_else(|| models.first().map(|model| model.id.clone()));
+        Ok(AgentModelCatalog {
+            models,
+            current_model,
+            current_effort: run.effort,
+        })
+    }
+
+    /// Switch the session's model/effort. Validated against the fresh
+    /// catalog, persisted for every later chained turn, and forwarded to a
+    /// live turn through the CLI control channel.
+    pub async fn set_model(
+        &self,
+        id: &str,
+        model: String,
+        effort: Option<String>,
+    ) -> Result<AgentModelSelectionResult> {
+        crate::database::validate_id(id)?;
+        let effort = effort
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if model.trim().is_empty()
+            || model.chars().count() > 300
+            || model.chars().any(|c| c.is_control())
+        {
+            return Err(Error::Invalid("模型无效".into()));
+        }
+        if let Some(effort) = &effort
+            && (effort.chars().count() > 80 || effort.chars().any(|c| c.is_control()))
+        {
+            return Err(Error::Invalid("思考强度无效".into()));
+        }
+        let id_for_env = id.to_owned();
+        let run = self
+            .0
+            .database
+            .call(move |store| store.agent_run(&id_for_env))
+            .await?;
+        let account_id = run.account_id.clone();
+        if run.agent == AgentKind::Deepseek {
+            if account_id.is_some() {
+                return Err(Error::Invalid(
+                    "DeepSeek Harness 使用本机 dsh 账号，不支持绑定 Prospero 账号".into(),
+                ));
+            }
+            let catalog = self.models(id).await?;
+            let selected = catalog
+                .models
+                .iter()
+                .find(|entry| entry.id == model)
+                .ok_or_else(|| Error::Invalid(format!("DeepSeek 模型不可用:{model}")))?;
+            if let Some(effort) = &effort
+                && !selected
+                    .supported_efforts
+                    .iter()
+                    .any(|level| level == effort)
+            {
+                return Err(Error::Invalid(format!("{model} 不支持推理强度 {effort}")));
+            }
+            let id_owned = id.to_owned();
+            let model_owned = model.clone();
+            let effort_owned = effort.clone();
+            let (model, effort) = self
+                .0
+                .database
+                .call(move |store| {
+                    store.set_agent_selection(&id_owned, &model_owned, effort_owned.as_deref())
+                })
+                .await?;
+            if let Ok(entry) = self.session_entry(id).await {
+                let guard = entry.handle.lock().await;
+                if let Some(handle) = guard.as_ref() {
+                    match handle
+                        .driver
+                        .lock()
+                        .await
+                        .apply_selection(&model, effort.as_deref())
+                        .await
+                    {
+                        Ok(()) | Err(Error::Closed) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            self.publish();
+            return Ok(AgentModelSelectionResult {
+                current_model: model,
+                current_effort: effort,
+            });
+        }
+        let environment = Self::account_environment(&self.0.database, account_id.clone()).await?;
+        // Profile sessions expose only the pinned model and never switch.
+        if let Some(id) = account_id {
+            let data = self.0.database.directory().to_owned();
+            let profile = self
+                .0
+                .database
+                .call(move |store| Ok(store.managed_snapshot_row(&data, &id)?.api_profile))
+                .await?;
+            if profile.is_some() {
+                return Err(Error::Invalid(
+                    "第三方 API Profile 的模型由 Profile 固定，无法在会话内切换".into(),
+                ));
+            }
+        }
+        let catalog = if run.agent == AgentKind::Codex {
+            super::usage::read_native_codex_models(self.0.database.directory())
+                .await?
+                .models
+        } else {
+            super::claude::fetch_launch_catalog(&environment).await?
+        };
+        let selected = catalog
+            .iter()
+            .find(|entry| entry.id == model)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "{} 模型不可用:{model}",
+                    if run.agent == AgentKind::Codex {
+                        "Codex"
+                    } else {
+                        "Claude"
+                    }
+                ))
+            })?;
+        if let Some(effort) = &effort
+            && !selected
+                .supported_efforts
+                .iter()
+                .any(|level| level == effort)
+        {
+            return Err(Error::Invalid(format!("{model} 不支持推理强度 {effort}")));
+        }
+        let id_owned = id.to_owned();
+        let model_owned = model.clone();
+        let effort_owned = effort.clone();
+        let (model, effort) = self
+            .0
+            .database
+            .call(move |store| {
+                store.set_agent_selection(&id_owned, &model_owned, effort_owned.as_deref())
+            })
+            .await?;
+
+        // Forward to a running turn. A closed pipe means the turn is already
+        // ending; the persisted selection still applies to the next turn.
+        if let Ok(entry) = self.session_entry(id).await {
+            let guard = entry.handle.lock().await;
+            if let Some(handle) = guard.as_ref() {
+                match handle
+                    .driver
+                    .lock()
+                    .await
+                    .apply_selection(&model, effort.as_deref())
+                    .await
+                {
+                    Ok(()) | Err(Error::Closed) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        self.publish();
+        Ok(AgentModelSelectionResult {
+            current_model: model,
+            current_effort: effort,
+        })
+    }
+
+    /// Active sessions' model/mode control flags for the desktop projection.
+    pub async fn controls(&self) -> Result<AgentControlsProjection> {
+        let controls = self.0.database.call(|store| store.agent_controls()).await?;
+        Ok(AgentControlsProjection { controls })
+    }
+
+    /// Send a direct follow-up prompt to a live Codex subagent thread.
+    pub async fn send_to_subagent(&self, id: &str, subagent: &str, text: String) -> Result<()> {
+        crate::database::validate_id(id)?;
+        crate::database::validate_id(subagent)?;
+        crate::database::validate_text(&text, 65_536, false)?;
+        let subagent_id = subagent.to_owned();
+        let snapshot = {
+            let id = id.to_owned();
+            let subagent = subagent_id.clone();
+            self.0
+                .database
+                .call(move |store| store.subagent_snapshot(&id, &subagent))
+                .await?
+        };
+        if !snapshot.subagent.can_message {
+            return Err(Error::Conflict);
+        }
+        let entry = self.session_entry(id).await?;
+        let guard = entry.handle.lock().await;
+        let handle = guard.as_ref().ok_or(Error::Conflict)?;
+        handle
+            .driver
+            .lock()
+            .await
+            .send_to_subagent(&subagent_id, &text)
+            .await
+    }
+
+    /// On-demand transcript for a Task-tool subagent's "查看执行详情" pane.
+    pub async fn subagent_snapshot(
+        &self,
+        id: &str,
+        subagent: &str,
+    ) -> Result<crate::agent::SubagentSnapshot> {
+        crate::database::validate_id(id)?;
+        crate::database::validate_id(subagent)?;
+        let mut snapshot = {
+            let id = id.to_owned();
+            let subagent = subagent.to_owned();
+            self.0
+                .database
+                .call(move |store| store.subagent_snapshot(&id, &subagent))
+                .await?
+        };
+
+        let native = match self.session_entry(id).await {
+            Ok(entry) => {
+                let handle = entry.handle.lock().await.clone();
+                if let Some(handle) = handle {
+                    handle
+                        .driver
+                        .lock()
+                        .await
+                        .read_subagent_history(subagent)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    self.read_codex_subagent_history_once(id, subagent).await
+                }
+            }
+            Err(_) => None,
+        };
+        if let Some(native) = native
+            && !native.is_empty()
+        {
+            let mut events = native;
+            events.extend(
+                snapshot
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event.get("kind").and_then(serde_json::Value::as_str),
+                            Some(
+                                "permission.request"
+                                    | "permission.resolved"
+                                    | "permission.auto"
+                                    | "question.request"
+                                    | "question.resolved"
+                            )
+                        )
+                    })
+                    .cloned(),
+            );
+            snapshot.events = events;
+        }
+        Ok(snapshot)
+    }
+
+    async fn read_codex_subagent_history_once(
+        &self,
+        id: &str,
+        subagent: &str,
+    ) -> Option<Vec<serde_json::Value>> {
+        let (workspace, parent) = {
+            let id = id.to_owned();
+            self.0
+                .database
+                .call(move |store| {
+                    let run = store.agent_run(&id)?;
+                    if run.agent != AgentKind::Codex {
+                        return Ok(None);
+                    }
+                    let Some(parent) = run.native_id else {
+                        return Ok(None);
+                    };
+                    let workspace = store.session(&id)?.workspace;
+                    Ok(Some((workspace, parent)))
+                })
+                .await
+                .ok()
+                .flatten()?
+        };
+        super::codex::read_subagent_history_once(
+            self.0.database.directory(),
+            &workspace,
+            &parent,
+            subagent,
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    pub async fn interrupt(&self, id: &str) -> Result<()> {
+        let entry = self.session_entry(id).await?;
+        let guard = entry.handle.lock().await;
+        let handle = guard.as_ref().ok_or(Error::NotFound)?;
+        // Any unresolved approvals are rejected and pending questions are
+        // denied when the turn is interrupted.
+        let pending: Vec<_> = std::mem::take(&mut *handle.replies.lock().await)
+            .into_iter()
+            .collect();
+        std::mem::take(&mut *handle.questions.lock().await);
+        std::mem::take(&mut *handle.records.lock().await);
+        for (_request_id, reply) in pending {
+            // The translator's reply task writes the deny frame.
+            let _ = reply.send(false);
+        }
+        drop(guard);
+        let resolved = {
+            let id = id.to_owned();
+            self.0
+                .database
+                .call(move |store| store.resolve_all_agent_requests(&id))
+                .await?
+        };
+        if resolved > 0 {
+            self.publish();
+        }
+        // Tell the CLI to stop after it finishes the current response.
+        let entry = self.session_entry(id).await?;
+        if let Some(handle) = entry.handle.lock().await.as_ref() {
+            handle.driver.lock().await.interrupt();
+        }
+        Ok(())
+    }
+
+    pub async fn close(&self, id: &str) -> Result<()> {
+        // Archive first: active=0 plus the queue delete closes the window in
+        // which a finishing chain could pop a queued row and relaunch a CLI
+        // for a session the user just killed.
+        let archived = id.to_owned();
+        self.0
+            .database
+            .call_control("agent.close", move |store| {
+                store.archive_agent_session(&archived, true)
+            })
+            .await?;
+        self.finish_close(id, false).await
+    }
+
+    /// Expire only an idle worker with an overdue, still-live dispatch. The
+    /// database claim checks the state again so a concurrent follow-up or
+    /// explicit delivery cannot be cut off by the health monitor.
+    pub async fn close_stale_idle_worker(
+        &self,
+        id: &str,
+        stale_before: i64,
+    ) -> Result<Option<Vec<String>>> {
+        let session_id = id.to_owned();
+        let run_ids = self
+            .0
+            .database
+            .call_control("worker.idle_timeout", move |store| {
+                store.archive_stale_idle_worker_session(&session_id, stale_before)
+            })
+            .await?;
+        if run_ids.is_some() {
+            self.finish_close(id, true).await?;
+        }
+        Ok(run_ids)
+    }
+
+    async fn finish_close(&self, id: &str, idle_timeout: bool) -> Result<()> {
+        if let Ok(entry) = self.session_entry(id).await {
+            if let Some(handle) = entry.handle.lock().await.take() {
+                let pending = std::mem::take(&mut *handle.replies.lock().await);
+                // Dropping pending question senders makes the translator
+                // answer deny; no explicit send needed.
+                std::mem::take(&mut *handle.questions.lock().await);
+                for (_request_id, reply) in pending {
+                    // The translator's reply task owns the deny frame; sending
+                    // here is enough, calling driver.respond_permission too
+                    // would write the frame twice.
+                    let _ = reply.send(false);
+                }
+                handle.driver.lock().await.kill();
+                let mut ended = entry.ended.subscribe();
+                let _ = tokio::time::timeout(Duration::from_secs(3), ended.changed()).await;
+            }
+            entry.permit.lock().await.take();
+            self.0.entries.lock().await.remove(id);
+        }
+        let archived = id.to_owned();
+        self.0
+            .database
+            .call_control("dispatch.reconcile", move |store| {
+                if idle_timeout {
+                    store.reconcile_stale_idle_worker_session(&archived)
+                } else {
+                    store.reconcile_dispatch_session(&archived)
+                }
+            })
+            .await?;
+        self.publish();
+        Ok(())
+    }
+
+    /// Archive runs left active by a previous daemon process. The provider
+    /// process is gone with that daemon, so turns are never replayed.
+    pub async fn recover(&self) -> Result<usize> {
+        let _ = super::codex::cleanup_stale_app_servers(self.0.database.directory()).await;
+        let ids: Vec<String> = self
+            .0
+            .database
+            .call_control("agent.close", |store| {
+                let mut statement = store.connection.prepare(
+                    "SELECT session_id FROM agent_runs WHERE active=1 ORDER BY session_id",
+                )?;
+                let ids = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(ids)
+            })
+            .await?;
+        for id in &ids {
+            let id = id.clone();
+            self.0
+                .database
+                .call_control("agent.close", move |store| {
+                    store.archive_agent_session(&id, true)
+                })
+                .await?;
+        }
+        Ok(ids.len())
+    }
+
+    pub async fn attachment_chunk(
+        &self,
+        id: &str,
+        message_id: &str,
+        attachment_id: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Option<AttachmentChunk>> {
+        crate::database::validate_id(id)?;
+        crate::timeline::validate_record_id(message_id)?;
+        crate::timeline::validate_record_id(attachment_id)?;
+        if length == 0 || length > 1024 * 1024 {
+            return Err(Error::Invalid("附件读取长度无效".into()));
+        }
+        let record = {
+            let id = id.to_owned();
+            let message_id = message_id.to_owned();
+            self.0
+                .database
+                .call(move |store| store.timeline_record(&id, &message_id))
+                .await?
+        };
+        let attachment = match record.body {
+            TimelineBody::Message { attachments, .. } => attachments
+                .into_iter()
+                .find(|attachment| attachment.id == attachment_id),
+            _ => None,
+        };
+        let Some(attachment) = attachment else {
+            return Ok(None);
+        };
+        let path = attachment_path(self.0.database.directory(), id, message_id, attachment_id)?;
+        let mime_type = attachment.mime_type;
+        tokio::task::spawn_blocking(move || {
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                return Ok(None);
+            };
+            if !metadata.is_file() {
+                return Ok(None);
+            }
+            let total = metadata.len();
+            if offset >= total {
+                return Ok(Some(AttachmentChunk {
+                    mime_type,
+                    data_b64: String::new(),
+                    total: total.min(i64::MAX as u64) as i64,
+                    eof: true,
+                }));
+            }
+            let want = length.min((total - offset).min(1024 * 1024) as usize);
+            use std::io::{Read, Seek};
+            let mut file = std::fs::File::open(path)?;
+            file.seek(std::io::SeekFrom::Start(offset))?;
+            let mut buffer = vec![0; want];
+            let read = file.read(&mut buffer)?;
+            buffer.truncate(read);
+            Ok(Some(AttachmentChunk {
+                mime_type,
+                data_b64: BASE64_STANDARD.encode(buffer),
+                total: total.min(i64::MAX as u64) as i64,
+                eof: offset + read as u64 >= total,
+            }))
+        })
+        .await
+        .map_err(|_| Error::Closed)?
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.0.closed.store(true, Ordering::Release);
+        let sessions: Vec<Arc<Session>> = self.0.entries.lock().await.values().cloned().collect();
+        for session in &sessions {
+            if let Some(handle) = session.handle.lock().await.take() {
+                let pending = std::mem::take(&mut *handle.replies.lock().await);
+                std::mem::take(&mut *handle.questions.lock().await);
+                for (_request_id, reply) in pending {
+                    // See close(): the translator task writes the deny frame.
+                    let _ = reply.send(false);
+                }
+                handle.driver.lock().await.kill();
+            }
+        }
+        for session in &sessions {
+            let mut ended = session.ended.subscribe();
+            let _ = tokio::time::timeout(Duration::from_secs(3), ended.changed()).await;
+        }
+        self.check()
+    }
+}
+
+/// Cap text persisted with a single streaming rewrite.
+fn bounded_text(mut text: String) -> String {
+    const LIMIT: usize = 60_000;
+    if text.len() <= LIMIT {
+        return text;
+    }
+    let mut end = LIMIT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn late_status_update_does_not_change_an_archived_session() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open(root.path().join("data")).await.unwrap();
+        let agents = Agents::new(database.clone());
+        let head = agents
+            .create(CreateAgentSession {
+                agent: AgentKind::Claude,
+                title: "late status".into(),
+                workspace: root.path().to_string_lossy().into_owned(),
+                auto_approve: false,
+                mode: None,
+                model: None,
+                effort: None,
+                agent_preset: None,
+                account_id: None,
+                resume: None,
+            })
+            .await
+            .unwrap();
+        agents.close(&head.id).await.unwrap();
+        assert!(matches!(
+            agents
+                .set_status(&head.id, SessionStatus::WaitingInput)
+                .await,
+            Err(Error::Closed)
+        ));
+        assert!(agents.check().is_ok());
+        let current = database
+            .read("test.closed_session", move |store| store.session(&head.id))
+            .await
+            .unwrap();
+        assert_eq!(current.lifecycle, SessionLifecycle::Archived);
+        assert_eq!(current.status, SessionStatus::Failed);
+        database.shutdown().await.unwrap();
+    }
+}

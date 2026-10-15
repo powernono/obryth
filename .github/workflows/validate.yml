@@ -1,0 +1,42 @@
+name: Validate Obryth
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - run: npm install --global pnpm@11.25.0
+      - run: rustup component add rustfmt clippy
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm protocol:build
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm test:rust
+      - run: pnpm prospero:build
+      - run: bash scripts/cargo.sh clippy --workspace --all-targets -- -D warnings
+      - run: bash scripts/cargo.sh build --release -p obryth-cli
+      - run: python3 scripts/smoke.py --binary target/release/obryth${{ runner.os == 'Windows' && '.exe' || '' }} --prospero apps/desktop/src-tauri/binaries/prosperod-rs${{ runner.os == 'Windows' && '.exe' || '' }}
+      - if: runner.os == 'macOS'
+        run: python3 scripts/tui-smoke.py --binary target/release/obryth
+      - run: pnpm --filter @obryth/desktop exec playwright install chromium
+      - run: pnpm --filter @obryth/desktop test:e2e
+      - run: pnpm --filter @obryth/mobile exec expo export --platform all --output-dir ../../artifacts/mobile-js
+      - run: pnpm desktop:build
+        env:
+          # Unsigned validation builds. Production signing is configured separately.
+          CI: 'true'

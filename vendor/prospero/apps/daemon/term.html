@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Prospero Terminal</title>
+<link rel="stylesheet" href="/assets/xterm.css" />
+<style>
+  :root {
+    color-scheme: dark;
+    --term-bg: #1a1b26;
+    --term-surface: #1f2130;
+    --term-blue: #7aa2f7;
+    --term-cyan: #7dcfff;
+    --term-fg: #c0caf5;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: var(--term-bg);
+    overflow: hidden;
+  }
+  body { position: relative; }
+  body::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    pointer-events: none;
+    box-shadow:
+      inset 0 1px rgba(125, 207, 255, 0.06),
+      inset 12px 0 28px -24px rgba(122, 162, 247, 0.4);
+  }
+  #term {
+    height: 100%;
+    width: 100%;
+    padding: 8px 3px 8px 10px;
+    box-sizing: border-box;
+  }
+  .xterm .xterm-viewport {
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-color: rgba(122, 162, 247, 0.34) transparent;
+  }
+  .xterm .xterm-viewport::-webkit-scrollbar { width: 9px; }
+  .xterm .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+  .xterm .xterm-viewport::-webkit-scrollbar-thumb {
+    background: rgba(122, 162, 247, 0.25);
+    border: 3px solid var(--term-bg);
+    border-radius: 999px;
+  }
+  .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+    background: rgba(125, 207, 255, 0.48);
+  }
+  #terminal-toast {
+    position: absolute;
+    right: 14px;
+    bottom: 13px;
+    z-index: 8;
+    max-width: min(320px, calc(100vw - 28px));
+    padding: 6px 10px;
+    border: 1px solid rgba(122, 162, 247, 0.28);
+    border-radius: 7px;
+    background: rgba(31, 33, 48, 0.94);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+    color: var(--term-fg);
+    font: 11px ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    opacity: 0;
+    transform: translateY(5px) scale(0.98);
+    transition: opacity 120ms ease, transform 120ms ease;
+    pointer-events: none;
+  }
+  #terminal-toast.visible {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  body.visual-bell::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 7;
+    pointer-events: none;
+    border: 1px solid rgba(125, 207, 255, 0.72);
+    box-shadow: inset 0 0 26px rgba(122, 162, 247, 0.16);
+    animation: terminal-bell 150ms ease-out;
+  }
+  @keyframes terminal-bell { from { opacity: 1; } to { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    #terminal-toast { transition: none; }
+    body.visual-bell::after { animation: none; opacity: 0; }
+  }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<div id="terminal-toast" role="status" aria-live="polite"></div>
+<script src="/assets/xterm.js"></script>
+<script src="/assets/fit.js"></script>
+<script src="/assets/webgl.js"></script>
+<script>
+  const post = (o) => window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(o));
+  const DEFAULT_FONT_FAMILY = "Cascadia Mono, Consolas, ui-monospace, SFMono-Regular, Menlo, Monaco, monospace";
+
+  function quotedCSSFontFamily(name) {
+    const clean = String(name || "")
+      .replace(/[\u0000-\u001f\u007f]/g, " ")
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, "\\\"");
+    return `"${clean}"`;
+  }
+
+  function fontStack(family) {
+    const preferred = typeof family === "string" ? family.trim() : "";
+    return preferred
+      ? `${quotedCSSFontFamily(preferred)}, ${DEFAULT_FONT_FAMILY}`
+      : DEFAULT_FONT_FAMILY;
+  }
+
+  const term = new window.Terminal({
+    scrollback: 3000,
+    fontSize: 12,
+    fontFamily: DEFAULT_FONT_FAMILY,
+    fontWeight: "400",
+    fontWeightBold: "600",
+    lineHeight: 1.16,
+    letterSpacing: 0.1,
+    minimumContrastRatio: 4.5,
+    // Tokyo Night —— 与 iTerm2 默认 profile 的深色配色逐值一致,
+    // 让 Mac 壳里的 tmux 终端和用户平时的 iTerm 看起来是同一个终端。
+    theme: {
+      background: "#1a1b26",
+      foreground: "#c0caf5",
+      cursor: "#c0caf5",
+      cursorAccent: "#1a1b26",
+      selectionBackground: "#283457",
+      selectionInactiveBackground: "#242b49",
+      scrollbarSliderBackground: "#7aa2f733",
+      scrollbarSliderHoverBackground: "#7dcfff66",
+      scrollbarSliderActiveBackground: "#7dcfff88",
+      black: "#15161e",
+      brightBlack: "#414868",
+      red: "#f7768e",
+      brightRed: "#f7768e",
+      green: "#9ece6a",
+      brightGreen: "#9ece6a",
+      yellow: "#e0af68",
+      brightYellow: "#e0af68",
+      blue: "#7aa2f7",
+      brightBlue: "#7aa2f7",
+      magenta: "#bb9af7",
+      brightMagenta: "#bb9af7",
+      cyan: "#7dcfff",
+      brightCyan: "#7dcfff",
+      white: "#a9b1d6",
+      brightWhite: "#c0caf5",
+    },
+    allowProposedApi: true,
+    cursorBlink: true,
+    cursorStyle: "bar",
+    cursorWidth: 2,
+    cursorInactiveStyle: "outline",
+    customGlyphs: true,
+    drawBoldTextInBrightColors: true,
+    rescaleOverlappingGlyphs: true,
+    smoothScrollDuration: 80,
+    fastScrollSensitivity: 4,
+    macOptionIsMeta: true,
+    macOptionClickForcesSelection: true,
+    altClickMovesCursor: false,
+    rightClickSelectsWord: true,
+    scrollOnUserInput: true,
+  });
+  const fit = new window.FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById("term"));
+
+  let renderer = "dom";
+  try {
+    const gl = new window.WebglAddon.WebglAddon();
+    gl.onContextLoss(() => gl.dispose());
+    term.loadAddon(gl);
+    renderer = "webgl";
+  } catch (e) {
+    // WebGL 不可用则回退 DOM 渲染(spike 会记录)
+  }
+
+  const te = new TextEncoder();
+  const td = new TextDecoder();
+  function bytesToB64(bytes) {
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(bin);
+  }
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  let toastTimer = null;
+  function showToast(message) {
+    const toast = document.getElementById("terminal-toast");
+    if (!toast || !message) return;
+    toast.textContent = message;
+    toast.classList.add("visible");
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.remove("visible"), 1250);
+  }
+
+  function sendInputText(text) {
+    if (replaying || !text) return;
+    post({ kind: "input", data: bytesToB64(te.encode(text)) });
+  }
+
+  // Keep macOS editing muscle memory while sending the actual zsh control
+  // sequences through the PTY. Ctrl shortcuts remain untouched for TUIs.
+  term.attachCustomKeyEventHandler((event) => {
+    if (event.type !== "keydown") return true;
+    const key = event.key.toLowerCase();
+    const windowsHost = /Win/i.test(navigator.platform || navigator.userAgent || "");
+    // Match Windows Terminal muscle memory without stealing Ctrl+C from shells
+    // and TUIs. Copy requires an active selection; otherwise Ctrl+C continues
+    // through xterm as the PTY interrupt byte. Ctrl+Shift+C/V always act as
+    // clipboard shortcuts.
+    if (windowsHost && event.ctrlKey && !event.metaKey && !event.altKey) {
+      if (key === "c" && (event.shiftKey || term.hasSelection())) {
+        if (term.hasSelection()) post({ kind: "clipboardCopy", text: term.getSelection() });
+        else showToast("先选择终端内容");
+        return false;
+      }
+      if (key === "v" && event.shiftKey) {
+        post({ kind: "clipboardPaste" });
+        return false;
+      }
+    }
+    if (event.metaKey && !event.ctrlKey && !event.altKey) {
+      if (key === "c") {
+        if (term.hasSelection()) {
+          post({ kind: "clipboardCopy", text: term.getSelection() });
+        } else {
+          showToast("按住 ⌥ 拖动选择文本");
+        }
+        return false;
+      }
+      if (key === "v") {
+        post({ kind: "clipboardPaste" });
+        return false;
+      }
+      if (key === "a") {
+        term.selectAll();
+        showToast("已选择终端内容");
+        return false;
+      }
+      if (key === "k") {
+        term.clear();
+        sendInputText("\x0c");
+        showToast("已清屏");
+        return false;
+      }
+      if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+        sendInputText("\x01"); // zsh beginning-of-line
+        return false;
+      }
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+        sendInputText("\x05"); // zsh end-of-line
+        return false;
+      }
+      if (event.key === "Backspace") {
+        sendInputText("\x15"); // zsh backward-kill-line
+        return false;
+      }
+      if (event.key === "Delete") {
+        sendInputText("\x0b"); // zsh kill-line
+        return false;
+      }
+    }
+    if (event.altKey && !event.metaKey && !event.ctrlKey) {
+      if (event.key === "ArrowLeft") {
+        sendInputText("\x1bb"); // zsh backward-word
+        return false;
+      }
+      if (event.key === "ArrowRight") {
+        sendInputText("\x1bf"); // zsh forward-word
+        return false;
+      }
+    }
+    if (event.shiftKey && event.key === "Insert") {
+      post({ kind: "clipboardPaste" });
+      return false;
+    }
+    return true;
+  });
+
+  // tmux copy-mode and modern CLIs use OSC 52 for the host clipboard. xterm
+  // intentionally leaves the OS integration to its embedder, so bridge writes
+  // to AppKit but never answer clipboard-read queries from terminal programs.
+  term.parser.registerOscHandler(52, (data) => {
+    const separator = data.indexOf(";");
+    if (separator < 0) return false;
+    const payload = data.slice(separator + 1);
+    if (payload === "?" || payload.length > 8 * 1024 * 1024) return true;
+    try {
+      post({ kind: "clipboardCopy", text: td.decode(b64ToBytes(payload)) });
+    } catch (_) {
+      showToast("无法读取终端剪贴板内容");
+    }
+    return true;
+  });
+
+  term.onBell(() => {
+    document.body.classList.remove("visual-bell");
+    // Force a style flush so repeated bells restart the short pulse.
+    void document.body.offsetWidth;
+    document.body.classList.add("visual-bell");
+    setTimeout(() => document.body.classList.remove("visual-bell"), 170);
+  });
+
+  /**
+   * 写快照期间屏蔽上行输入。
+   *
+   * xterm 会自动应答终端查询(DA / DSR 等)—— 这在正常输出流上是必须的,
+   * Claude Code 那类 Ink 应用不回答就会挂住。但 attach 时重放快照,
+   * 快照里若含查询序列,xterm 会【再答一次】,而那次应答会被当成用户
+   * 敲的键送进 shell:实测表现是命令行上凭空多出 "1;2c",把命令打乱。
+   * 重放产生的应答不是用户意图,丢掉。
+   */
+  let replaying = false;
+  term.onData((d) => {
+    if (replaying) return;
+    post({ kind: "input", data: bytesToB64(te.encode(d)) });
+  });
+
+  // 首次尺寸必须等原生层发来受控字号后再计算。否则 ready 之后的默认 12px fit
+  // 可能先触发 attach，随后 Dynamic Type 才改变列数，造成短暂错配。
+  let fontReady = false;
+  let fontRevision = 0;
+  let fitTimer = null;
+  function doFit() {
+    if (!fontReady || fitTimer) return;
+    fitTimer = setTimeout(() => {
+      fitTimer = null;
+      if (!fontReady) return;
+      try { fit.fit(); } catch (e) {}
+      post({ kind: "resized", cols: term.cols, rows: term.rows });
+    }, 50);
+  }
+
+  // 性能打点(W4 spike):有输出流量的秒窗上报 fps 与吞吐
+  let perfBytes = 0;
+  let perfFrames = 0;
+  let perfLast = performance.now();
+  // Older desktop/Swift bridges keep their existing behavior until they send activity.
+  let perfActive = true;
+  let perfEnabled = true;
+  let perfFrame = null;
+  function perfLoop() {
+    if (!perfActive || !perfEnabled || perfFrame !== null) return;
+    perfFrame = requestAnimationFrame(() => {
+      perfFrame = null;
+      perfFrames++;
+      const now = performance.now();
+      if (now - perfLast >= 1000) {
+        if (perfBytes > 0) {
+          post({
+            kind: "perf",
+            fps: Math.round((perfFrames * 1000) / (now - perfLast)),
+            kb: Math.round(perfBytes / 1024),
+            renderer,
+          });
+        }
+        perfFrames = 0;
+        perfBytes = 0;
+        perfLast = now;
+      }
+      perfLoop();
+    });
+  }
+  perfLoop();
+
+  function handle(m) {
+    if (m.kind === "activity") {
+      perfActive = m.active !== false;
+      perfEnabled = m.metrics !== false;
+      if (perfFrame !== null) cancelAnimationFrame(perfFrame);
+      perfFrame = null;
+      perfFrames = 0;
+      perfBytes = 0;
+      perfLast = performance.now();
+      perfLoop();
+    } else if (m.kind === "snapshot") {
+      replaying = true;
+      term.reset();
+      if (m.cols && m.rows && (m.cols !== term.cols || m.rows !== term.rows)) {
+        term.resize(m.cols, m.rows);
+      }
+      // 回调里放开:xterm 的应答是异步发出的,同步清标志会漏掉
+      term.write(m.ansi, () => { replaying = false; });
+      perfBytes += m.ansi.length;
+    } else if (m.kind === "output") {
+      const bytes = b64ToBytes(m.dataB64);
+      term.write(bytes);
+      perfBytes += bytes.length;
+    } else if (m.kind === "fit") {
+      doFit();
+    } else if (m.kind === "font") {
+      const requestedSize = Number(m.size);
+      const size = Number.isFinite(requestedSize)
+        ? Math.min(72, Math.max(6, requestedSize))
+        : 12;
+      const family = typeof m.family === "string" ? m.family.trim() : "";
+      term.options.fontFamily = fontStack(family);
+      term.options.fontSize = size;
+      fontReady = false;
+      const revision = ++fontRevision;
+      const fitted = () => {
+        if (revision !== fontRevision) return;
+        fontReady = true;
+        doFit();
+      };
+      // 本机字体通常立即可用；仍等 FontFaceSet 确认一次再 fit，避免先按
+      // fallback 的字宽算列数，下一帧换成 Nerd Font 后文字与 tmux 网格错位。
+      if (family && document.fonts && document.fonts.load) {
+        document.fonts.load(`${size}px ${quotedCSSFontFamily(family)}`).then(fitted, fitted);
+      } else {
+        fitted();
+      }
+    } else if (m.kind === "focus") {
+      term.focus();
+    } else if (m.kind === "blur") {
+      term.blur();
+    } else if (m.kind === "scrollBottom") {
+      term.scrollToBottom();
+    } else if (m.kind === "paste") {
+      if (typeof m.text === "string" && m.text.length > 0) term.paste(m.text);
+    } else if (m.kind === "selectAll") {
+      term.selectAll();
+    } else if (m.kind === "clear") {
+      term.clear();
+    } else if (m.kind === "toast") {
+      showToast(m.text);
+    }
+  }
+
+  /**
+   * 入口:一次可以带多条消息(RN 侧把同一 tick 内到达的输出合并成一批)。
+   * 每次跨桥都有固定开销,洪峰时逐条过桥是纯浪费。
+   */
+  function receive(payload) {
+    const batch = JSON.parse(payload);
+    for (let i = 0; i < batch.length; i++) handle(batch[i]);
+  }
+
+  // 走 postMessage 而不是 injectJavaScript:后者要把数据 JSON 序列化两遍、
+  // 拼成一段 JS 源码、再由引擎 eval —— 输出流上这是每块都付一次的冤枉钱。
+  window.addEventListener("message", (e) => receive(e.data));
+  document.addEventListener("message", (e) => receive(e.data));
+  // 保留旧入口:RN 侧首帧仍可能用 injectJavaScript 兜底。
+  // Mac 壳的 WKWebView 没有 postMessage 通路,只能走 evaluateJavaScript,
+  // 所以这里也接受数组 —— 让它能和 receive 一样一次过桥送完一批。
+  window.__rx = (jsonStr) => {
+    const m = JSON.parse(jsonStr);
+    if (Array.isArray(m)) { for (let i = 0; i < m.length; i++) handle(m[i]); }
+    else handle(m);
+  };
+
+  new ResizeObserver(() => doFit()).observe(document.body);
+  // 点终端取得焦点唤起键盘。
+  //
+  // 必须区分"点"和"划":早先版本对任何 touchend 都 focus(),结果是收起键盘后
+  // 一滚动就又被拉回来 —— 根本关不掉。只有位移很小、时长很短的才算点击。
+  /**
+   * 捏合缩放字号,吸附到预设档位。
+   *
+   * 吸附是刻意的:自由缩放会停在 11.3px 这种值上,等宽字体在非整数字号下
+   * 渲染发虚,而手机上本来就看得吃力。档位之间跳,每一档都清晰。
+   */
+  (function pinchZoom() {
+    const STEPS = [8, 9, 10, 11, 12, 14, 16, 18, 20];
+    const el = document.getElementById("term");
+    let base = 0, startSize = 12;
+    const dist = (t) => Math.hypot(
+      t[0].clientX - t[1].clientX,
+      t[0].clientY - t[1].clientY,
+    );
+    el.addEventListener("touchstart", (e) => {
+      if (e.touches.length !== 2) return;
+      base = dist(e.touches);
+      startSize = term.options.fontSize;
+    }, { passive: true });
+    el.addEventListener("touchmove", (e) => {
+      if (e.touches.length !== 2 || base === 0) return;
+      const target = startSize * (dist(e.touches) / base);
+      let best = STEPS[0];
+      for (const s of STEPS) {
+        if (Math.abs(s - target) < Math.abs(best - target)) best = s;
+      }
+      if (best !== term.options.fontSize) {
+        term.options.fontSize = best;
+        doFit();
+        post({ kind: "fontSize", size: best });
+      }
+    }, { passive: true });
+    el.addEventListener("touchend", (e) => {
+      if (e.touches.length < 2) base = 0;
+    }, { passive: true });
+  })();
+
+  (function tapToFocus() {
+    const el = document.getElementById("term");
+    let sx = 0, sy = 0, st = 0, moved = false;
+    el.addEventListener("touchstart", (e) => {
+      const t = e.touches[0];
+      if (!t) return;
+      sx = t.clientX; sy = t.clientY; st = Date.now(); moved = false;
+    }, { passive: true });
+    el.addEventListener("touchmove", (e) => {
+      const t = e.touches[0];
+      if (!t) return;
+      if (Math.abs(t.clientX - sx) > 10 || Math.abs(t.clientY - sy) > 10) moved = true;
+    }, { passive: true });
+    el.addEventListener("touchend", () => {
+      if (!moved && Date.now() - st < 500) term.focus();
+    }, { passive: true });
+  })();
+  window.addEventListener("load", () => {
+    post({ kind: "ready", renderer });
+  });
+</script>
+</body>
+</html>

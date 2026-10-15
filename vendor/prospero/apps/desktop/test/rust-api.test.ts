@@ -1,0 +1,161 @@
+import { describe, expect, it, vi } from "vitest";
+import { RustClient } from "../src/main/rust-client";
+import { applySessionChanges, previousCursors, visibleRows } from "../src/renderer/src/rust/session-page";
+import type { ChangeEvent, SessionHead } from "@prospero/protocol/rust-daemon";
+
+const token = "a".repeat(64);
+const head: SessionHead = { id: "fixture", agent: "codex", kind: "structured", title: "Example", workspace: "/synthetic", lifecycle: "archived", status: "completed", createdAt: 1, updatedAt: 1, revision: 1 };
+
+describe("Rust desktop API boundary", () => {
+  it("polls an accepted worker start without submitting another launch", async () => {
+    const outcome = { task: { id: "task-1" }, dispatch: { id: "dispatch-1" }, sessionId: "session-1", worktree: null };
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: "queued", operation: { operationId: "operation-1", phase: "queued" } }), { status: 202 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ operationId: "operation-1", phase: "running", outcome })));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    const input = { taskId: "task-1", cwd: "/synthetic", agent: "codex", worktree: "none", skills: [], approvalPolicy: "standard", accountId: null, operationId: "operation-1" } as const;
+    await expect(client.startWorker({ ...input, skills: [] })).resolves.toEqual(outcome);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[0]![1]?.headers).toMatchObject({ prefer: "respond-async" });
+    expect(String(fetcher.mock.calls[1]![0])).toMatch(/\/v1\/workers\/start-operations\/operation-1$/);
+    expect(fetcher.mock.calls[1]![1]?.method).toBeUndefined();
+  });
+
+  it("does not retry a worker launch whose delivery is unknown", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ status: "delivery_unknown", operation: { operationId: "operation-1", phase: "delivery_unknown", error: "Delivery requires reconciliation" } }), { status: 202 }));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    await expect(client.startWorker({ taskId: "task-1", cwd: "/synthetic", agent: "codex", worktree: "none", skills: [], approvalPolicy: "standard", accountId: null, operationId: "operation-1" })).rejects.toThrow("Delivery requires reconciliation");
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("reads task activities in a single run-scoped request", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ activities: [] })));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    await expect(client.taskActivities("run-1", ["task-1", "task-2"])).resolves.toEqual({ activities: [] });
+    expect(String(fetcher.mock.calls[0]![0])).toMatch(/\/v1\/runs\/run-1\/task-activities$/);
+    expect(fetcher.mock.calls[0]![1]?.body).toBe(JSON.stringify({ taskIds: ["task-1", "task-2"] }));
+  });
+
+  it("waits for terminal input acknowledgement without the generic RPC deadline, but remains cancellable", async () => {
+    const controller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (_url, init) => {
+      await new Promise<void>((_done, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true }));
+      return new Response("{}");
+    });
+    try {
+      const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+      const pending = client.terminalInput("fixture", Uint8Array.of(97), controller.signal);
+      expect(timeout).not.toHaveBeenCalled();
+      expect(fetcher.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
+      controller.abort();
+      await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      expect(fetcher).toHaveBeenCalledOnce();
+    } finally { timeout.mockRestore(); }
+  });
+  it.each(["https://example.invalid", "http://example.invalid", "http://127.0.0.1/path", "http://user@127.0.0.1", "http://127.0.0.1?token=fixture"])("rejects a non-local or credential-bearing daemon address", value => {
+    expect(() => new RustClient(value, token)).toThrow();
+  });
+
+  it("uses bounded typed routes with owner credentials and no redirects", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => new Response(JSON.stringify({ items: [], hasMore: false, nextCursor: null })));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    await client.sessions({ limit: 100, cursor: "cursor+value", lifecycle: "archived", workspace: null, text: null });
+    const [url, init] = fetcher.mock.calls[0]!;
+    expect(String(url)).toContain("cursor=cursor%2Bvalue");
+    expect(init?.headers).toMatchObject({ authorization: `Bearer ${token}` });
+    expect(init?.redirect).toBe("error");
+    await client.sidebarSessions({ limit: 20, cursor: null, lifecycle: "active", workspace: null, text: null });
+    expect(String(fetcher.mock.calls[1]![0])).toContain("/v1/sessions/sidebar?");
+    await client.sidebarLookup(["fixture"]);
+    expect(String(fetcher.mock.calls[2]![0])).toContain("/v1/sessions/sidebar/lookup");
+    expect(() => client.session("../accounts")).toThrow();
+  });
+
+  it("checks per-terminal stream support only after the daemon advertises v1", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ capabilities: ["terminal.stream.v1"] })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ supported: false })));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    expect((await client.health()).capabilities).toContain("terminal.stream.v1");
+    await expect(client.terminalStreamCapabilities("fixture")).resolves.toEqual({ supported: false });
+    expect(String(fetcher.mock.calls[1]![0])).toBe("http://127.0.0.1:12345/v1/terminals/fixture/stream-capabilities");
+    expect(fetcher.mock.calls[1]![1]?.headers).toMatchObject({ authorization: `Bearer ${token}` });
+  });
+
+  it("requests usage with optional session id", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => new Response(JSON.stringify({ type: "usage.result", available: false, windows: [], accounts: [] })));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    await client.usage("fixture");
+    expect(String(fetcher.mock.calls[0]![0])).toBe("http://127.0.0.1:12345/v1/usage?sid=fixture");
+    await client.usage();
+    expect(String(fetcher.mock.calls[1]![0])).toBe("http://127.0.0.1:12345/v1/usage");
+    expect(() => client.usage("../bad")).toThrow("Invalid record");
+  });
+
+  it("does not expose server error payloads or secrets", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ code: "storage", message: token }), { status: 500 }));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    await expect(client.health()).rejects.toThrow("500");
+    fetcher.mockResolvedValue(new Response(JSON.stringify({ code: "conflict", message: token }), { status: 409 }));
+    await expect(client.rename("fixture", { revision: 1, title: "Rename" })).rejects.toThrow("记录已变更");
+  });
+
+  it("propagates cancellation without exposing the caller's abort reason", async () => {
+    const controller = new AbortController();
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (_url, init) => {
+      await new Promise<void>((_done, reject) => init?.signal?.addEventListener("abort", () => reject(new Error(token)), { once: true }));
+      return new Response("{}");
+    });
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    const pending = client.events({ scope: "sessions", afterSeq: 0, limit: 100 }, controller.signal);
+    controller.abort(token);
+    await expect(pending).rejects.toMatchObject({ name: "AbortError", message: "Request cancelled" });
+    expect(fetcher.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+  });
+
+  it("passes filters and bounded lookups without placing credentials in URLs", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => new Response("{}"));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    await client.sessions({ limit: null, cursor: null, lifecycle: null, workspace: "/example?value", text: "中文 & words" });
+    const url = new URL(String(fetcher.mock.calls[0]![0]));
+    expect(url.searchParams.get("workspace")).toBe("/example?value");
+    expect(url.searchParams.get("text")).toBe("中文 & words");
+    expect(url.searchParams.has("limit")).toBe(false);
+    await client.summary("/example?value");
+    expect(new URL(String(fetcher.mock.calls[1]![0])).searchParams.get("workspace")).toBe("/example?value");
+    await client.workspaces({ limit: 20, cursor: "/path+space" });
+    expect(new URL(String(fetcher.mock.calls[2]![0])).searchParams.get("cursor")).toBe("/path+space");
+    await client.lookup(["fixture", "missing"]);
+    expect(fetcher.mock.calls[3]![1]?.body).toBe(JSON.stringify({ ids: ["fixture", "missing"] }));
+    expect(() => client.lookup(Array(101).fill("fixture"))).toThrow("limit");
+    expect(() => client.lookup(["invalid/id"])).toThrow("Invalid record");
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+
+  it("rejects oversized responses and invalid content cursors", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response("x".repeat(2 * 1024 * 1024 + 1)));
+    const client = new RustClient("http://127.0.0.1:12345", token, fetcher);
+    await expect(client.health()).rejects.toThrow("page limit");
+    fetcher.mockResolvedValue(new Response("hello", { headers: { "x-next-offset": "999" } }));
+    await expect(client.content("fixture", "history", 0)).rejects.toThrow("Invalid content cursor");
+  });
+});
+
+describe("bounded Rust session pages", () => {
+  it("applies newer events only to records already in the page", () => {
+    const event = (id: string, revision: number): ChangeEvent => ({ scope: "sessions", seq: revision, kind: "session.updated", entityId: id, data: { ...head, id, revision, title: "Updated" } });
+    const items = applySessionChanges([head], [event("fixture", 3), event("fixture", 2), event("outside", 4), { ...event("fixture", 10), scope: "other" }]);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.revision).toBe(3);
+    expect(applySessionChanges(items, [event("fixture", 2)])[0]).toBe(items[0]);
+    expect(head.title).toBe("Example");
+  });
+
+  it("bounds rendered rows and navigation history independently of archive size", () => {
+    const visible = visibleRows(100000, 300000, 600);
+    expect(visible.end - visible.start).toBeLessThanOrEqual(15);
+    expect(visible.start).toBeGreaterThan(0);
+    expect(previousCursors(Array.from({ length: 1000 }, (_, index) => String(index)), "new")).toHaveLength(64);
+  });
+});

@@ -1,0 +1,422 @@
+import type { WindowMenuAction, WindowMenuRequest } from "./window-menu";
+import type { EventPage, TimelinePage, TimelineQuery, TimelineLookupResult, TimelineTextQuery, TimelineTextPage } from "@prospero/protocol/rust-daemon";
+import type { AgentAccountConfig, AgentAccountFeatureError, AgentApiCatalogModel, AgentReasoningEffort, C2SAgentAccountApiModelsGet, C2SAgentAccountConfigSet, S2CAgentAccountApiModelsResult, S2CAgentAccountConfigResult } from "@prospero/protocol";
+import type { ModelSource, ModelSourceAction, ResumableConversation, S2CModelSourceResult } from "@prospero/protocol";
+export type { ModelSource, ModelSourceRoute, ModelSourceAction, ModelSourceMigration, ModelSourceBinding, S2CModelSourceResult } from "@prospero/protocol";
+
+export type { AgentAccountConfig, AgentAccountFeatureError, AgentApiCatalogModel, AgentReasoningEffort };
+import type { RemoteWorkspace, RemoteDirectoryRequest, RemoteDirectoryListing, RemoteWorkspaceInput, RemoteWorkspaceOpenOptions, RemoteWorkspaceOpenResult } from "./remote-workspaces";
+export type { RemoteWorkspace, RemoteDirectoryRoot, RemoteDirectoryRequest, RemoteDirectoryListing, RemoteWorkspaceInput, RemoteWorkspaceOpenOptions, RemoteWorkspaceOpenResult } from "./remote-workspaces";
+export type AccountModelsInput = Omit<C2SAgentAccountApiModelsGet, "type" | "requestId">;
+export type AccountConfigInput = Omit<C2SAgentAccountConfigSet, "type" | "requestId">;
+
+export type JsonObject = Record<string, unknown>;
+
+export type QueuedChatMessage = {
+  id: string;
+  text: string;
+  kind: "queue" | "guide";
+  createdAt: number;
+  attachmentCount: number;
+};
+
+export type SessionInfo = {
+  terminalMode?: "events";
+  historyMode?: "paged";
+  id: string;
+  agent: string;
+  kind: "pty" | "structured" | string;
+  title: string;
+  displayTitle?: string;
+  cwd: string;
+  status: string;
+  preview?: string;
+  createdAt?: number;
+  accountId?: string;
+  accountName?: string;
+  model?: string;
+  effort?: string;
+  pendingPermissions?: number;
+  pendingQuestions?: number;
+  approvalPolicy?: string;
+  busySince?: number;
+  agentControls?: {
+    compact: boolean;
+    model: boolean;
+    mode: boolean;
+    currentModel?: string;
+    currentEffort?: string;
+    currentMode?: string;
+  };
+  messageQueue?: QueuedChatMessage[];
+  subagents?: Array<{ id: string; name?: string; role?: string; status?: string }>;
+};
+
+/**
+ * The daemon's complete session population can be very large.  The desktop
+ * snapshot deliberately carries only the sessions that need immediate UI
+ * attention; these counters describe the complete population without making
+ * every renderer refresh pay to deserialize it.
+ */
+export type SessionSummary = {
+  total: number;
+  active: number;
+  attention: number;
+  terminal: number;
+  /** Number of session records included in the live desktop snapshot. */
+  included: number;
+  /** Number of session records available through the paged control API only. */
+  omitted: number;
+  activeLimit: number;
+  attentionLimit: number;
+  recentTerminalLimit: number;
+  truncated: boolean;
+};
+
+/** Cursor is opaque and must be returned unchanged to request the next page. */
+export type SessionPageRequest = {
+  workspace?: string;
+  requestId?: string;
+  cursor?: string;
+  limit?: number;
+  query?: string;
+  /** Exact IDs for persisted pinned sessions; bounded by the desktop IPC. */
+  ids?: string[];
+  /** Restrict the page to terminal sessions. */
+  terminal?: boolean;
+};
+
+export type SessionPage = {
+  items: SessionInfo[];
+  nextCursor?: string;
+  previousCursor?: string;
+  total: number;
+  active: number;
+  terminal: number;
+};
+
+export type DeviceInfo = {
+  id: string;
+  name: string;
+  allowShell: boolean;
+  allowOrchestration: boolean;
+  bound: boolean;
+  relayReady?: boolean;
+  lastSeenAt?: number;
+};
+
+export type RemoteHostSummary = {
+  id: string;
+  name: string;
+  addrs: string[];
+  port: number;
+  lastConnectedAt?: number;
+  hasRelay?: boolean;
+};
+
+export type RemoteShellEvent = {
+  hostId: string;
+  message: JsonObject;
+};
+
+export type RuntimeSwitchState = {
+  backend: "rust" | "legacy";
+  selected: "rust" | "legacy";
+  selectionReason: "env" | "preference" | "packaged-default" | "development-default";
+  forced: boolean;
+  rustAvailable: boolean;
+  rustBinary: string;
+  fallbackAvailable: boolean;
+  legacyAvailable: boolean;
+  defaultBackend: "rust" | "legacy";
+  lastRollbackAt?: number;
+  lastRollbackReason?: string;
+};
+
+export type DaemonSnapshot = {
+  workspaceCounts?: Record<string, { revision: number; total: number; active: number; archived: number; attention: number }>;
+  metadataRevision?: string;
+  running: boolean;
+  managed: boolean;
+  fullAccess: boolean;
+  starting: boolean;
+  startupProgress: number;
+  startupStage: string;
+  pid?: number;
+  port: number;
+  bind: string;
+  state: string;
+  lastError?: string;
+  daemonVersion?: string;
+  buildId?: string;
+  expectedBuildId?: string;
+  updatePending?: boolean;
+  persistence: { pty: boolean; structured: boolean };
+  capabilities?: string[];
+  relay: JsonObject;
+  runtime?: RuntimeSwitchState;
+  /** Global counts; `sessions` below is intentionally a bounded live slice. */
+  sessionSummary?: SessionSummary;
+  sessions: SessionInfo[];
+  schedules?: JsonObject[];
+};
+
+export type DesktopSettings = {
+  startDaemonOnLaunch: boolean;
+  daemonBackend: "rust" | "legacy";
+  fullAccessPermission: boolean;
+  minimizeToTray: boolean;
+  launchAtLogin: boolean;
+  theme: "system" | "dark" | "light";
+  workspaceSort: "recent" | "name";
+  terminalFontFamily: string;
+  terminalFontSize: number;
+  /** daemon 的监听地址;0.0.0.0 表示全部网卡。下次启动 daemon 时生效。 */
+  daemonBind: string;
+};
+
+export type WorkflowTemplateNode = {
+  title: string;
+  spec: string;
+  dependencyIndexes: number[];
+  skills: string[];
+};
+
+export type WorkflowTemplate = {
+  id: string;
+  name: string;
+  description: string;
+  nodes: WorkflowTemplateNode[];
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type SkillInfo = {
+  name: string;
+  description: string;
+  path: string;
+  scope: string;
+};
+
+export type OrchestrationSnapshot = {
+  runs: JsonObject[];
+  tasks: JsonObject[];
+  dispatches: JsonObject[];
+  gates: JsonObject[];
+  worktreeAssets: JsonObject[];
+};
+
+export type JsonEntityCollectionPatch = {
+  upserts?: JsonObject[];
+  removedIds?: string[];
+  order?: string[];
+};
+
+export type OrchestrationSnapshotPatch = Partial<
+  Record<keyof OrchestrationSnapshot, JsonEntityCollectionPatch>
+>;
+
+export type DesktopSnapshot = {
+  daemon: DaemonSnapshot;
+  projects: string[];
+  projectAliases: Record<string, string>;
+  pinnedProjectPaths: string[];
+  pinnedSessionIds: string[];
+  /** 桌面端本地的归档标记:会话仍在 daemon 里活着,只是从主列表收起。 */
+  archivedSessionIds: string[];
+  unreadSessionIds: string[];
+  workflowTemplates: WorkflowTemplate[];
+  devices: DeviceInfo[];
+  accounts: JsonObject[];
+  orchestration: OrchestrationSnapshot;
+  logs: string;
+  settings: DesktopSettings;
+};
+
+/**
+ * Incremental daemon patch.  A normal status refresh changes a handful of
+ * live records, so replacing `sessions` would invalidate every session row in
+ * the renderer.  The first snapshot can still use `sessions`; later updates
+ * use ID-addressed changes and, only when needed, a lightweight order vector.
+ */
+export type DaemonSnapshotPatch = Omit<Partial<DaemonSnapshot>, "sessions"> & {
+  sessions?: SessionInfo[];
+  sessionUpserts?: SessionInfo[];
+  sessionRemovedIds?: string[];
+  sessionOrder?: string[];
+};
+
+/** Top-level snapshot slices sent after the initial full snapshot. */
+export type DesktopSnapshotPatch = Omit<Partial<DesktopSnapshot>, "daemon" | "orchestration"> & {
+  daemon?: DaemonSnapshotPatch;
+  orchestration?: OrchestrationSnapshot;
+  orchestrationDelta?: OrchestrationSnapshotPatch;
+};
+
+export type SessionCreateInput = {
+  cwd: string;
+  sourceSessionId?: string;
+  agent: "codex" | "claude" | "deepseek" | "opencode" | "grok" | "trae" | "shell" | "custom";
+  kind: "structured" | "pty";
+  approvalPolicy: "strict" | "standard" | "yolo";
+  mode?: "default" | "plan";
+  model?: string | undefined;
+  effort?: string | undefined;
+  agentPreset?: string | undefined;
+  command?: string;
+  accountId?: string | undefined;
+  resume?: Pick<ResumableConversation, "id" | "title"> | { id: string; title?: string; fork?: true } | undefined;
+  cols?: number;
+  rows?: number;
+};
+
+export type UsageWindow = { label: string; utilization: number; resetsAt?: string };
+export type UsageDailyBucket = { date: string; tokens: number };
+export type CodexAccountUsage = {
+  lifetimeTokens?: number;
+  creditsUnlimited?: boolean;
+  creditsBalance?: string;
+  spendLimit?: string;
+  spendUsed?: string;
+  spendRemainingPercent?: number;
+  dailyUsage?: UsageDailyBucket[];
+};
+export type UsageAccount = {
+  agent: string;
+  accountId?: string;
+  accountName?: string;
+  source?: "subscription" | "api" | "unknown";
+  available: boolean;
+  subscription?: string | null;
+  costUsd?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  lifetimeTokens?: number;
+  creditsUnlimited?: boolean;
+  creditsBalance?: string;
+  spendLimit?: string;
+  spendUsed?: string;
+  spendRemainingPercent?: number;
+  dailyUsage?: UsageDailyBucket[];
+  windows: UsageWindow[];
+  reason?: string;
+};
+export type UsageReport = {
+  available: boolean;
+  subscription?: string | null;
+  costUsd?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  lifetimeTokens?: number;
+  creditsUnlimited?: boolean;
+  creditsBalance?: string;
+  spendLimit?: string;
+  spendUsed?: string;
+  spendRemainingPercent?: number;
+  dailyUsage?: UsageDailyBucket[];
+  windows?: UsageWindow[];
+  accounts?: UsageAccount[];
+  reason?: string;
+};
+export type AgentMode = { id: string; label: string; description?: string };
+export type AgentModeCatalog = { modes: AgentMode[]; currentMode?: string };
+export type AgentModel = { id: string; label: string; description?: string; supportedEfforts: string[]; defaultEffort?: string; isDefault?: boolean };
+export type AgentPreset = { id: string; name: string; description?: string; isDefault?: boolean; custom?: boolean };
+export type AgentModelCatalog = { models: AgentModel[]; currentModel?: string; currentEffort?: string; presets?: AgentPreset[]; currentPreset?: string };
+export type SkillSuggestion = { value: string; label?: string; detail?: string };
+
+export type DesktopApi = import("./project-tools").ProjectToolsApi & {
+  modelSourceAction(action: ModelSourceAction): Promise<S2CModelSourceResult>;
+  subscribeModelSources(listener: (sources: ModelSource[]) => void): () => void;
+  getSnapshot(): Promise<DesktopSnapshot>;
+  subscribeSnapshot(listener: (patch: DesktopSnapshotPatch) => void): () => void;
+  startDaemon(): Promise<{ ok: boolean; error?: string }>;
+  stopDaemon(): Promise<{ ok: boolean; error?: string }>;
+  restartDaemon(): Promise<{ ok: boolean; error?: string }>;
+  chooseProject(): Promise<string | null>;
+  forgetProject(path: string): Promise<DesktopSnapshot>;
+  renameProject(path: string, name: string): Promise<DesktopSnapshot>;
+  setProjectPinned(path: string, pinned: boolean): Promise<DesktopSnapshot>;
+  setSessionPinned(sessionId: string, pinned: boolean): Promise<DesktopSnapshot>;
+  setSessionArchived(sessionId: string, archived: boolean): Promise<DesktopSnapshot>;
+  setSessionUnread(sessionId: string, unread: boolean): Promise<DesktopSnapshot>;
+  forgetMissingSession(sessionId: string): Promise<DesktopSnapshot>;
+  renameSession(sessionId: string, title: string): Promise<DesktopSnapshot>;
+  revealPath(path: string): Promise<{ ok: boolean; error?: string }>;
+  openWindowsTerminal(path: string): Promise<{ ok: boolean; error?: string }>;
+  /** 宿主平台。静态值,用来让"在资源管理器中打开"这类字样跟着系统走。 */
+  platform: NodeJS.Platform;
+  openWindowMenu(request: WindowMenuRequest): Promise<WindowMenuAction | null>;
+  listNetworkInterfaces(): Promise<Array<{ label: string; address: string }>>;
+  /** 剪贴板走主进程:渲染进程的权限被一律拒绝,网页 Clipboard API 在这里用不了。 */
+  /** 终端里的链接交给系统浏览器;主进程只放行 http(s)。 */
+  openExternal(url: string): Promise<{ ok: boolean }>;
+  readClipboard(): Promise<string>;
+  saveTerminalClipboardImage(sessionId: string): Promise<{ path: string }>;
+  openTerminalContextMenu(options: { copy: boolean; paste: boolean }): Promise<void>;
+  /** Opens an authenticated v1 attachment. Its port is delivered as a window message keyed by requestId. */
+  openTerminalStream(sessionId: string, requestId: string): Promise<{ supported: boolean }>;
+  writeClipboard(value: string): Promise<{ ok: boolean }>;
+  createSession(input: SessionCreateInput): Promise<SessionInfo>;
+  createCrossModelChild(sessionId: string, input: { sourceId: string; routeId: string; revision: number; agent: "codex" | "claude" | "opencode"; task: string; title?: string }): Promise<JsonObject>;
+  /** Fetch terminal/history records only when a list or search needs them. */
+  listSessions(request?: SessionPageRequest): Promise<SessionPage>;
+  cancelSessionPage(requestId: string): Promise<void>;
+  readTimeline(sessionId: string, query: TimelineQuery, requestId: string): Promise<TimelinePage>;
+  readTimelineChanges(sessionId: string, after: number, requestId: string): Promise<EventPage>;
+  lookupTimeline(sessionId: string, ids: string[], requestId: string): Promise<TimelineLookupResult>;
+  readTimelineText(sessionId: string, recordId: string, query: TimelineTextQuery, requestId: string): Promise<TimelineTextPage>;
+  getSessionView(sessionId: string, query?: Record<string, number>): Promise<JsonObject | null>;
+  cancelSessionView(sessionId: string): Promise<{ ok: boolean }>;
+  interact(sessionId: string, message: JsonObject): Promise<JsonObject | null>;
+  interruptSession(sessionId: string): Promise<void>;
+  killSession(sessionId: string): Promise<void>;
+  getToolOutput(sessionId: string, callId: string): Promise<JsonObject>;
+  getSubagentEvents(sessionId: string, subagentId: string): Promise<JsonObject>;
+  getUsage(sessionId?: string): Promise<UsageReport>;
+  getSkillSuggestions(sessionId: string, query: string): Promise<SkillSuggestion[]>;
+  listSkills(cwd: string): Promise<SkillInfo[]>;
+  revealSkill(path: string, cwd: string): Promise<{ ok: boolean; error?: string }>;
+  getAgentModes(sessionId: string): Promise<AgentModeCatalog>;
+  setAgentMode(sessionId: string, mode: string): Promise<{ currentMode: string }>;
+  getLaunchModels(agent: "codex" | "claude" | "deepseek" | "opencode", accountId?: string): Promise<AgentModelCatalog>;
+  getAgentModels(sessionId: string): Promise<AgentModelCatalog>;
+  setAgentModel(sessionId: string, model: string, effort?: string): Promise<{ currentModel: string; currentEffort?: string }>;
+  orchestrationAction(method: string, params: JsonObject): Promise<JsonObject>;
+  getOrchestrationTask(taskId: string): Promise<JsonObject>;
+  getOrchestrationRunTasks(runId: string): Promise<JsonObject[]>;
+  saveWorkflowTemplate(template: WorkflowTemplate): Promise<DesktopSnapshot>;
+  deleteWorkflowTemplate(templateId: string): Promise<DesktopSnapshot>;
+  resolveGate(gateId: string, decision: string): Promise<void>;
+  settleOrchestrationDispatch(dispatchId: string, success: boolean, outcome: string): Promise<JsonObject>;
+  accountAction(message: JsonObject): Promise<JsonObject>;
+  getAccountModels(input: AccountModelsInput): Promise<S2CAgentAccountApiModelsResult>;
+  getAccountConfig(accountId: string): Promise<S2CAgentAccountConfigResult>;
+  setAccountConfig(input: AccountConfigInput): Promise<S2CAgentAccountConfigResult>;
+  pairDevice(input: { name: string; allowShell: boolean; allowOrchestration: boolean }): Promise<{ output: string; uri?: string }>;
+  revokeDevice(id: string, name: string): Promise<{ ok: boolean; output: string; cancelled?: boolean }>;
+  relayAction(input: { action: "status" | "enable" | "disable" | "rotate-key"; url?: string }): Promise<JsonObject>;
+  updateSettings(patch: Partial<DesktopSettings>): Promise<{ settings: DesktopSettings }>;
+  clearLogs(): Promise<{ ok: boolean; cancelled?: boolean }>;
+  listRemoteHosts(): Promise<RemoteHostSummary[]>;
+  importRemoteHost(pairingUri: string): Promise<RemoteHostSummary>;
+  removeRemoteHost(id: string): Promise<{ ok: boolean }>;
+  connectRemoteHost(id: string): Promise<{ name: string; sessions: number }>;
+  listRemoteWorkspaces(): Promise<RemoteWorkspace[]>;
+  listRemoteDirectories(input: RemoteDirectoryRequest): Promise<RemoteDirectoryListing>;
+  addRemoteWorkspace(input: RemoteWorkspaceInput): Promise<RemoteWorkspace>;
+  forgetRemoteWorkspace(id: string): Promise<{ ok: boolean }>;
+  renameRemoteWorkspace(id: string, name: string): Promise<RemoteWorkspace>;
+  listRemoteWorkspaceShells(id: string): Promise<SessionInfo[]>;
+  openRemoteWorkspace(id: string, options?: RemoteWorkspaceOpenOptions): Promise<RemoteWorkspaceOpenResult>;
+  subscribeRemoteWorkspaces(listener: (workspaces: RemoteWorkspace[]) => void): () => void;
+  createRemoteShell(hostId: string, cwd?: string): Promise<string>;
+  listRemoteShells(hostId: string): Promise<SessionInfo[]>;
+  attachRemoteShell(hostId: string, sid: string, ownerId?: string): Promise<void>;
+  detachRemoteShell(hostId: string, sid: string, ownerId?: string): Promise<void>;
+  sendRemoteShellInput(hostId: string, sid: string, dataB64: string, ownerId?: string): Promise<void>;
+  resizeRemoteShell(hostId: string, sid: string, cols: number, rows: number, ownerId?: string): Promise<void>;
+  killRemoteShell(hostId: string, sid: string): Promise<void>;
+  disconnectRemoteHost(id: string): Promise<void>;
+  subscribeRemoteShell(listener: (event: RemoteShellEvent) => void): () => void;
+};

@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Obryth Browser Companion",
+  "version": "0.1.0",
+  "description": "Import a chosen site's cookies into your local Obryth browser.",
+  "permissions": ["activeTab", "cookies", "nativeMessaging"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Import this site into Obryth"
+  }
+}

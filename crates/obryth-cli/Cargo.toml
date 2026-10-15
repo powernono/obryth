@@ -1,0 +1,34 @@
+[package]
+name = "obryth-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "obryth"
+
+[[bin]]
+name = "obryth"
+path = "src/main.rs"
+
+[dependencies]
+obryth-core = { path = "../obryth-core" }
+prospero-client = { path = "../../vendor/prospero/crates/prospero-client" }
+prospero-protocol-rs = { path = "../../vendor/prospero/crates/prospero-protocol" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+axum = "0.8"
+ratatui = "0.29"
+crossterm = "0.28"
+base64 = "0.22"
+tempfile = "3"
+fs2 = "0.4"
+shell-words = "1"
+regex = "1"
+notify = "8"
+
+[dev-dependencies]
+tempfile = "3"

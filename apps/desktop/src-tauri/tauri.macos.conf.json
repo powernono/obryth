@@ -1,0 +1,19 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Obryth",
+        "width": 1440,
+        "height": 960,
+        "minWidth": 780,
+        "minHeight": 580,
+        "decorations": true,
+        "transparent": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 16, "y": 25 }
+      }
+    ]
+  }
+}

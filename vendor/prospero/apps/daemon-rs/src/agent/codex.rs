@@ -1,0 +1,3528 @@
+//! Direct Codex app-server structured driver.
+//!
+//! This is the Rust daemon's native counterpart for the TS Codex adapter's
+//! JSON-RPC-over-stdio path.  The first slice intentionally focuses on the
+//! core session lifecycle (initialize, thread start/resume, turn start,
+//! streamed assistant/reasoning text and completion) so Codex structured
+//! sessions no longer fall back to the legacy daemon boundary.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, mpsc, oneshot};
+
+use super::claude::{AdapterEvent, QuestionOptionSpec, QuestionReply, QuestionSpec, TurnOptions};
+use super::store::{ApprovalPolicy, PermissionMode};
+use crate::error::{Error, Result};
+
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+const APP_SERVER_LEASE_VERSION: i64 = 2;
+
+type StderrTail = Arc<Mutex<String>>;
+
+enum PendingResponse {
+    Reply {
+        method: String,
+        tx: oneshot::Sender<std::result::Result<Value, String>>,
+    },
+    FinishOnError {
+        method: String,
+        subagent: Option<String>,
+        retry_params: Option<Value>,
+    },
+}
+
+type PendingResponses = Arc<Mutex<HashMap<String, PendingResponse>>>;
+
+struct NotificationState {
+    current_turn: Arc<Mutex<Option<String>>>,
+    current_turns: Arc<Mutex<HashMap<String, String>>>,
+    responses: PendingResponses,
+    diagnostics: ProcessDiagnostics,
+}
+
+fn binary() -> String {
+    std::env::var("PROSPERO_CODEX_BIN").unwrap_or_else(|_| "codex".into())
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_owned();
+    }
+    value.chars().take(max).collect()
+}
+
+fn tail_chars(value: &str, max: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= max {
+        return value.to_owned();
+    }
+    chars[chars.len().saturating_sub(max)..].iter().collect()
+}
+
+fn strip_ansi_and_controls(value: &str) -> String {
+    enum State {
+        Text,
+        Escape,
+        Csi,
+    }
+    let mut state = State::Text;
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match state {
+            State::Text => match ch {
+                '\u{1b}' => state = State::Escape,
+                '\r' | '\n' | '\t' => out.push(ch),
+                c if c.is_control() => {}
+                c => out.push(c),
+            },
+            State::Escape => {
+                state = if ch == '[' { State::Csi } else { State::Text };
+            }
+            State::Csi => {
+                if ('@'..='~').contains(&ch) {
+                    state = State::Text;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn sensitive_env(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("key")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("authorization")
+}
+
+fn redact_arg(arg: &str) -> String {
+    let lower = arg.to_ascii_lowercase();
+    let sensitive = lower.contains("api_key=")
+        || lower.contains("token=")
+        || lower.contains("secret=")
+        || lower.contains("password=")
+        || lower.contains("authorization=");
+    if sensitive {
+        if let Some((key, _)) = arg.split_once('=') {
+            return format!("{}=<redacted>", truncate_chars(key, 200));
+        }
+        return "<redacted>".into();
+    }
+    truncate_chars(&strip_ansi_and_controls(arg), 300)
+}
+
+fn diagnostic_context(diagnostics: &ProcessDiagnostics, stderr_tail: Option<&str>) -> String {
+    let command = std::iter::once(diagnostics.file.as_str())
+        .chain(diagnostics.args.iter().map(String::as_str))
+        .map(redact_arg)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let env = diagnostics
+        .env
+        .iter()
+        .map(|(key, value)| {
+            if sensitive_env(key) {
+                format!("{key}=<{}>", if value.is_empty() { "empty" } else { "set" })
+            } else {
+                format!(
+                    "{key}={}",
+                    truncate_chars(&strip_ansi_and_controls(value), 300)
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut parts = vec![
+        format!("命令：{command}"),
+        format!(
+            "工作目录：{}",
+            truncate_chars(&strip_ansi_and_controls(&diagnostics.cwd), 500)
+        ),
+    ];
+    if !env.is_empty() {
+        parts.push(format!("环境：{env}"));
+    }
+    if let Some(tail) = stderr_tail {
+        let clean = strip_ansi_and_controls(tail);
+        let tail = tail_chars(clean.trim(), 1000);
+        if !tail.is_empty() {
+            parts.push(format!("最近 stderr：{tail}"));
+        }
+    }
+    parts.join("；")
+}
+
+fn diagnostic_message_sync(diagnostics: &ProcessDiagnostics, prefix: &str) -> String {
+    truncate_chars(
+        &format!("{prefix}；{}", diagnostic_context(diagnostics, None)),
+        4000,
+    )
+}
+
+async fn diagnostic_message(diagnostics: &ProcessDiagnostics, prefix: &str) -> String {
+    // stderr and stdout close notifications race. Give the stderr drain a tiny
+    // chance to capture the final diagnostic line before we publish the error.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let tail = diagnostics.stderr_tail.lock().await.clone();
+    truncate_chars(
+        &format!("{prefix}；{}", diagnostic_context(diagnostics, Some(&tail))),
+        4000,
+    )
+}
+
+async fn rpc_error_message(
+    method: Option<&str>,
+    error: &Value,
+    diagnostics: &ProcessDiagnostics,
+) -> String {
+    let code = error.get("code").map(|value| summarize(Some(value)));
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("codex RPC failed");
+    let data = error
+        .get("data")
+        .filter(|value| !value.is_null())
+        .map(|value| summarize(Some(value)));
+    let mut prefix = match method {
+        Some(method) => format!("codex {method} JSON-RPC error"),
+        None => "codex app-server JSON-RPC error".into(),
+    };
+    if let Some(code) = code {
+        prefix.push_str(&format!(" code={code}"));
+    }
+    prefix.push_str(&format!(": {}", truncate_chars(message, 1000)));
+    if let Some(data) = data {
+        prefix.push_str(&format!("；data：{}", truncate_chars(&data, 1000)));
+    }
+    diagnostic_message(diagnostics, &prefix).await
+}
+
+fn sandbox_policy_schema_error(error: &Value) -> bool {
+    let haystack = format!(
+        "{} {}",
+        summarize(error.get("message")),
+        summarize(error.get("data"))
+    );
+    let lower = haystack.to_ascii_lowercase();
+    lower.contains("unknown variant")
+        && (haystack.contains("danger-full-access")
+            || haystack.contains("workspace-write")
+            || haystack.contains("dangerFullAccess")
+            || haystack.contains("workspaceWrite"))
+}
+
+fn alternate_sandbox_policy(policy: &Value) -> Option<Value> {
+    let typ = policy.get("type").and_then(Value::as_str)?;
+    match typ {
+        "danger-full-access" => Some(json!({ "type": "dangerFullAccess" })),
+        "dangerFullAccess" => Some(json!({ "type": "danger-full-access" })),
+        "workspace-write" => Some(json!({
+            "type": "workspaceWrite",
+            "writableRoots": policy
+                .get("writable_roots")
+                .or_else(|| policy.get("writableRoots"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        })),
+        "workspaceWrite" => Some(json!({
+            "type": "workspace-write",
+            "writable_roots": policy
+                .get("writableRoots")
+                .or_else(|| policy.get("writable_roots"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        })),
+        _ => None,
+    }
+}
+
+fn alternate_turn_start_params(params: &Value) -> Option<Value> {
+    let mut object = params.as_object()?.clone();
+    let alternate = alternate_sandbox_policy(object.get("sandboxPolicy")?)?;
+    object.insert("sandboxPolicy".into(), alternate);
+    Some(Value::Object(object))
+}
+
+async fn retry_turn_start(
+    writer: &mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+    responses: &PendingResponses,
+    method: String,
+    subagent: Option<String>,
+    params: Value,
+) -> bool {
+    let id = uuid::Uuid::new_v4().as_u128().to_string();
+    responses.lock().await.insert(
+        id.clone(),
+        PendingResponse::FinishOnError {
+            method: method.clone(),
+            subagent,
+            retry_params: None,
+        },
+    );
+    writer
+        .send((
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+            None,
+        ))
+        .await
+        .is_ok()
+}
+
+fn spawn_stderr_tail_drain(mut stderr: tokio::process::ChildStderr, stderr_tail: StderrTail) {
+    tokio::spawn(async move {
+        let mut buffer = [0_u8; 2048];
+        loop {
+            let read = match stderr.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            let chunk = String::from_utf8_lossy(&buffer[..read]);
+            let mut tail = stderr_tail.lock().await;
+            tail.push_str(&chunk);
+            if tail.chars().count() > 4000 {
+                *tail = tail_chars(&tail, 4000);
+            }
+        }
+    });
+}
+
+async fn fail_pending_responses(responses: &PendingResponses, message: String) {
+    let pending = {
+        let mut guard = responses.lock().await;
+        guard
+            .drain()
+            .map(|(_, pending)| pending)
+            .collect::<Vec<_>>()
+    };
+    for pending in pending {
+        if let PendingResponse::Reply { tx, .. } = pending {
+            let _ = tx.send(Err(message.clone()));
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn kill_process_group(pid: u32) {
+    if pid <= 1 {
+        return;
+    }
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn kill_process_group(pid: u32) {
+    let _ = pid;
+}
+
+#[cfg(unix)]
+fn set_private_dir_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    if result != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    }
+    std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .ok()
+        .map(|output| {
+            !String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with('Z')
+        })
+        .unwrap_or(true)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn process_identity(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("/bin/ps")
+        .env("LC_ALL", "C")
+        .args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "command="])
+        .output()
+        .ok()?;
+    let identity = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (output.status.success() && !identity.is_empty()).then_some(identity)
+}
+
+#[cfg(not(unix))]
+fn process_identity(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn process_group_members(pgid: u32) -> Option<Vec<u32>> {
+    let Ok(output) = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,pgid=,stat="])
+        .output()
+    else {
+        return None;
+    };
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let pid = parts.next()?.parse::<u32>().ok()?;
+                let group = parts.next()?.parse::<u32>().ok()?;
+                let state = parts.next()?;
+                (group == pgid && !state.starts_with('Z')).then_some(pid)
+            })
+            .collect(),
+    )
+}
+
+#[cfg(unix)]
+fn group_alive(pgid: u32) -> bool {
+    process_group_members(pgid).is_none_or(|members| !members.is_empty())
+}
+
+#[cfg(not(unix))]
+fn group_alive(_pgid: u32) -> bool {
+    true
+}
+
+#[cfg(unix)]
+struct VerifiedProcessGroup {
+    pgid: u32,
+    members: Vec<(u32, String)>,
+}
+
+#[cfg(unix)]
+impl VerifiedProcessGroup {
+    fn capture(leader: u32, expected: &str) -> Option<Self> {
+        if process_identity(leader).as_deref() != Some(expected)
+            || unsafe { libc::getpgid(leader as i32) } != leader as i32
+        {
+            return None;
+        }
+        let members = process_group_members(leader)?
+            .into_iter()
+            .filter_map(|pid| process_identity(pid).map(|identity| (pid, identity)))
+            .collect::<Vec<_>>();
+        members
+            .iter()
+            .any(|(pid, identity)| *pid == leader && identity == expected)
+            .then_some(Self {
+                pgid: leader,
+                members,
+            })
+    }
+
+    fn still_owned(&self) -> bool {
+        self.members.iter().any(|(pid, identity)| {
+            process_alive(*pid)
+                && unsafe { libc::getpgid(*pid as i32) } == self.pgid as i32
+                && process_identity(*pid).as_ref() == Some(identity)
+        })
+    }
+
+    fn terminate(&self) {
+        unsafe {
+            libc::kill(-(self.pgid as i32), libc::SIGTERM);
+        }
+        for _ in 0..10 {
+            if !group_alive(self.pgid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if self.still_owned() {
+            unsafe {
+                libc::kill(-(self.pgid as i32), libc::SIGKILL);
+            }
+        }
+        for _ in 0..10 {
+            if !group_alive(self.pgid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+fn safe_lease_directory(home: &Path) -> Option<PathBuf> {
+    existing_safe_dir(home)?;
+    existing_safe_dir(&home.join(".prospero"))?;
+    existing_safe_dir(&app_server_lease_dir(home))
+}
+
+fn read_lease(home: &Path, path: &Path) -> Option<Value> {
+    let directory = safe_lease_directory(home)?;
+    if path.parent()?.canonicalize().ok()? != directory {
+        return None;
+    }
+    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16384 {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let child = safe_pid(value.get("childPid"))?;
+    safe_pid(value.get("ownerPid"))?;
+    if value.get("version").and_then(Value::as_i64) != Some(APP_SERVER_LEASE_VERSION)
+        || safe_pid(value.get("processGroup")) != Some(child)
+        || path.file_stem()?.to_str()?.parse::<u32>().ok()? != child
+    {
+        return None;
+    }
+    match value.get("threadId") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(thread)) => crate::database::validate_id(thread).ok()?,
+        Some(_) => return None,
+    }
+    Some(value)
+}
+
+fn codex_home_from_environment(environment: &[(String, String)]) -> Option<PathBuf> {
+    environment
+        .iter()
+        .rev()
+        .find(|(key, value)| key == "CODEX_HOME" && !value.is_empty())
+        .map(|(_, value)| PathBuf::from(value))
+}
+
+fn existing_safe_dir(path: &Path) -> Option<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    path.canonicalize().ok()
+}
+
+fn owned_codex_home_from_environment(
+    data: &Path,
+    environment: &[(String, String)],
+) -> Option<PathBuf> {
+    let requested_home = codex_home_from_environment(environment)?;
+    let canonical_data = data.canonicalize().ok()?;
+    let relative = requested_home
+        .strip_prefix(data)
+        .or_else(|_| requested_home.strip_prefix(&canonical_data))
+        .ok()?;
+    let data = canonical_data;
+    let mut cursor = data.clone();
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return None;
+        }
+        cursor.push(component);
+        existing_safe_dir(&cursor)?;
+    }
+    let home = existing_safe_dir(&requested_home)?;
+    let roots = data.join("agent-accounts");
+    let native_home = roots
+        .join("codex-usage")
+        .join(super::usage::NATIVE_CODEX_ID)
+        .join("home");
+    if existing_safe_dir(&native_home).as_deref() == Some(home.as_path()) {
+        return Some(home);
+    }
+    let managed_root = existing_safe_dir(&roots.join("codex"))?;
+    let relative = home.strip_prefix(managed_root).ok()?;
+    if relative.components().count() == 1 {
+        Some(home)
+    } else {
+        None
+    }
+}
+
+fn app_server_lease_dir(codex_home: &Path) -> PathBuf {
+    codex_home.join(".prospero").join("app-server-leases")
+}
+
+fn thread_writer_lock(codex_home: &Path, thread_id: &str) -> Option<PathBuf> {
+    if crate::database::validate_id(thread_id).is_err() {
+        return None;
+    }
+    let directory = existing_safe_dir(&codex_home.join("thread-writer-locks"))?;
+    let lock = directory.join(format!("{thread_id}.lock"));
+    if std::fs::symlink_metadata(&lock)
+        .is_ok_and(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        return None;
+    }
+    Some(lock)
+}
+
+fn cleanup_thread_writer_lock(codex_home: Option<&Path>, thread_id: &str) {
+    let Some(codex_home) = codex_home else {
+        return;
+    };
+    let Some(lock) = thread_writer_lock(codex_home, thread_id) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&lock);
+}
+
+fn safe_pid(value: Option<&Value>) -> Option<u32> {
+    let pid = value?.as_u64()?;
+    (pid > 1 && pid <= i32::MAX as u64).then_some(pid as u32)
+}
+
+fn lease_json(child_pid: u32, thread_id: Option<&str>) -> Value {
+    json!({
+        "version": APP_SERVER_LEASE_VERSION,
+        "ownerPid": std::process::id(),
+        "childPid": child_pid,
+        "childIdentity": process_identity(child_pid),
+        "processGroup": child_pid,
+        "threadId": thread_id,
+        "createdAt": crate::database::now(),
+    })
+}
+
+fn write_app_server_lease(codex_home: &Path, child_pid: u32) -> Result<PathBuf> {
+    if let Ok(metadata) = std::fs::symlink_metadata(codex_home)
+        && (!metadata.is_dir() || metadata.file_type().is_symlink())
+    {
+        return Err(Error::Invalid("CODEX_HOME 不是安全目录".into()));
+    }
+    let state_root = codex_home.join(".prospero");
+    if let Ok(metadata) = std::fs::symlink_metadata(&state_root)
+        && (!metadata.is_dir() || metadata.file_type().is_symlink())
+    {
+        return Err(Error::Invalid("CODEX_HOME 运行目录无效".into()));
+    }
+    let directory = app_server_lease_dir(codex_home);
+    std::fs::create_dir_all(&directory)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&directory)
+        && (!metadata.is_dir() || metadata.file_type().is_symlink())
+    {
+        return Err(Error::Invalid("CODEX_HOME app-server 租约目录无效".into()));
+    }
+    let _ = set_private_dir_permissions(&directory);
+    let path = directory.join(format!("{child_pid}.json"));
+    let temporary = directory.join(format!(".{child_pid}.{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec(&lease_json(child_pid, None))?,
+    )?;
+    let _ = set_private_file_permissions(&temporary);
+    std::fs::rename(&temporary, &path)?;
+    Ok(path)
+}
+
+fn update_app_server_lease(path: &Path, child_pid: u32, thread_id: &str) {
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    if std::fs::write(
+        &temporary,
+        serde_json::to_vec(&lease_json(child_pid, Some(thread_id))).unwrap_or_default(),
+    )
+    .is_ok()
+    {
+        let _ = set_private_file_permissions(&temporary);
+        let _ = std::fs::rename(temporary, path);
+    }
+}
+
+fn cleanup_stale_app_servers_in_home(codex_home: &Path) -> usize {
+    let Some(directory) = safe_lease_directory(codex_home) else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return 0;
+    };
+    let mut cleaned = 0;
+    for entry in entries.filter_map(std::result::Result::ok).take(1024) {
+        let path = entry.path();
+        let Some(value) = read_lease(codex_home, &path) else {
+            continue;
+        };
+        let Some(owner_pid) = safe_pid(value.get("ownerPid")) else {
+            continue;
+        };
+        if process_alive(owner_pid) {
+            continue;
+        }
+        let Some(child_pid) = safe_pid(value.get("childPid")) else {
+            continue;
+        };
+        if value
+            .get("threadId")
+            .and_then(Value::as_str)
+            .is_some_and(|thread_id| thread_writer_lock(codex_home, thread_id).is_none())
+        {
+            continue;
+        }
+        if process_alive(child_pid) {
+            let Some(expected) = value.get("childIdentity").and_then(Value::as_str) else {
+                continue;
+            };
+            #[cfg(unix)]
+            {
+                let Some(group) = VerifiedProcessGroup::capture(child_pid, expected) else {
+                    continue;
+                };
+                group.terminate();
+            }
+            #[cfg(not(unix))]
+            let _ = expected;
+        }
+        if group_alive(child_pid) {
+            continue;
+        }
+        if let Some(thread_id) = value.get("threadId").and_then(Value::as_str) {
+            if other_thread_lease_alive(codex_home, thread_id, child_pid) {
+                continue;
+            }
+            cleanup_thread_writer_lock(Some(codex_home), thread_id);
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            cleaned += 1;
+        }
+    }
+    cleaned
+}
+
+fn other_thread_lease_alive(home: &Path, thread_id: &str, child_pid: u32) -> bool {
+    let Some(directory) = safe_lease_directory(home) else {
+        return true;
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return true;
+    };
+    entries.filter_map(std::result::Result::ok).any(|entry| {
+        let Some(value) = read_lease(home, &entry.path()) else {
+            return true;
+        };
+        let pid = safe_pid(value.get("childPid"));
+        pid != Some(child_pid)
+            && value.get("threadId").and_then(Value::as_str) == Some(thread_id)
+            && pid.is_some_and(process_alive)
+    })
+}
+
+pub(crate) async fn preflight_app_servers(
+    data: &Path,
+    environment: &[(String, String)],
+) -> Result<()> {
+    if let Some(home) = owned_codex_home_from_environment(data, environment) {
+        tokio::task::spawn_blocking(move || cleanup_stale_app_servers_in_home(&home))
+            .await
+            .map_err(|_| Error::Closed)?;
+    }
+    Ok(())
+}
+
+fn owned_homes(data: &Path) -> Vec<PathBuf> {
+    let roots = data.join("agent-accounts");
+    let mut homes = vec![
+        roots
+            .join("codex-usage")
+            .join(super::usage::NATIVE_CODEX_ID)
+            .join("home"),
+    ];
+    if let Ok(entries) = std::fs::read_dir(roots.join("codex")) {
+        homes.extend(
+            entries
+                .filter_map(std::result::Result::ok)
+                .take(1024)
+                .map(|entry| entry.path()),
+        );
+    }
+    homes
+        .into_iter()
+        .filter_map(|home| {
+            owned_codex_home_from_environment(
+                data,
+                &[("CODEX_HOME".into(), home.to_string_lossy().into_owned())],
+            )
+        })
+        .collect()
+}
+
+fn diagnostic_homes(data: &Path, deadline: std::time::Instant) -> (Vec<PathBuf>, bool) {
+    let roots = data.join("agent-accounts");
+    let native = roots
+        .join("codex-usage")
+        .join(super::usage::NATIVE_CODEX_ID)
+        .join("home");
+    let mut homes = owned_codex_home_from_environment(
+        data,
+        &[("CODEX_HOME".into(), native.to_string_lossy().into_owned())],
+    )
+    .into_iter()
+    .collect::<Vec<_>>();
+    let mut truncated = false;
+    if let Ok(entries) = std::fs::read_dir(roots.join("codex")) {
+        for entry in entries {
+            if homes.len() >= 256 || std::time::Instant::now() >= deadline {
+                truncated = true;
+                break;
+            }
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let path = entry.path();
+            if let Some(home) = owned_codex_home_from_environment(
+                data,
+                &[("CODEX_HOME".into(), path.to_string_lossy().into_owned())],
+            ) {
+                homes.push(home);
+            }
+        }
+    }
+    (homes, truncated)
+}
+
+pub(crate) async fn cleanup_stale_app_servers(data: &Path) -> Result<usize> {
+    let data = data.to_owned();
+    tokio::task::spawn_blocking(move || {
+        Ok(owned_homes(&data)
+            .into_iter()
+            .map(|home| cleanup_stale_app_servers_in_home(&home))
+            .sum())
+    })
+    .await
+    .map_err(|_| Error::Closed)?
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppServerDiagnostic {
+    pub codex_home: String,
+    pub lease_path: Option<String>,
+    pub owner_pid: Option<u32>,
+    pub child_pid: Option<u32>,
+    pub thread_id: Option<String>,
+    pub owner_alive: bool,
+    pub child_alive: bool,
+    pub identity_matches: bool,
+    pub lock_present: bool,
+    pub state: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppServerDiagnosticPage {
+    pub items: Vec<AppServerDiagnostic>,
+    pub truncated: bool,
+}
+
+pub async fn app_server_diagnostics_page(data: &Path) -> Result<AppServerDiagnosticPage> {
+    let data = data.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        let mut scanned = 0;
+        let (homes, mut truncated) = diagnostic_homes(&data, deadline);
+        let mut results = Vec::new();
+        for home in homes {
+            if scanned >= 256 || std::time::Instant::now() >= deadline {
+                truncated = true;
+                break;
+            }
+            let mut leased_threads = HashSet::new();
+            if let Some(directory) = safe_lease_directory(&home)
+                && let Ok(entries) = std::fs::read_dir(directory)
+            {
+                for entry in entries {
+                    if scanned >= 256 || std::time::Instant::now() >= deadline {
+                        truncated = true;
+                        break;
+                    }
+                    scanned += 1;
+                    let Ok(entry) = entry else {
+                        continue;
+                    };
+                    let path = entry.path();
+                    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let lease = read_lease(&home, &path);
+                    let owner = lease
+                        .as_ref()
+                        .and_then(|value| safe_pid(value.get("ownerPid")));
+                    let child = lease
+                        .as_ref()
+                        .and_then(|value| safe_pid(value.get("childPid")));
+                    let thread_id = lease
+                        .as_ref()
+                        .and_then(|value| value.get("threadId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if let Some(thread_id) = thread_id.as_ref() {
+                        leased_threads.insert(thread_id.clone());
+                    }
+                    let owner_alive = owner.is_some_and(process_alive);
+                    let child_alive = child.is_some_and(process_alive);
+                    let expected = lease
+                        .as_ref()
+                        .and_then(|value| value.get("childIdentity"))
+                        .and_then(Value::as_str);
+                    let identity_matches = expected.is_some()
+                        && child.and_then(process_identity).as_deref() == expected;
+                    let lock_present = thread_id
+                        .as_deref()
+                        .and_then(|id| thread_writer_lock(&home, id))
+                        .is_some_and(|path| path.exists());
+                    results.push(AppServerDiagnostic {
+                        codex_home: home.to_string_lossy().into_owned(),
+                        lease_path: Some(path.to_string_lossy().into_owned()),
+                        owner_pid: owner,
+                        child_pid: child,
+                        thread_id,
+                        owner_alive,
+                        child_alive,
+                        identity_matches,
+                        lock_present,
+                        state: if lease.is_none() {
+                            "unverified"
+                        } else if owner_alive {
+                            "owned"
+                        } else if child_alive && !identity_matches {
+                            "identity_mismatch"
+                        } else {
+                            "stale"
+                        }
+                        .into(),
+                    });
+                }
+            }
+            if let Some(directory) = existing_safe_dir(&home.join("thread-writer-locks"))
+                && let Ok(entries) = std::fs::read_dir(directory)
+            {
+                for entry in entries {
+                    if scanned >= 256 || std::time::Instant::now() >= deadline {
+                        truncated = true;
+                        break;
+                    }
+                    scanned += 1;
+                    let Ok(entry) = entry else {
+                        continue;
+                    };
+                    let path = entry.path();
+                    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                        continue;
+                    };
+                    if !metadata.is_file()
+                        || metadata.file_type().is_symlink()
+                        || path.extension().and_then(|value| value.to_str()) != Some("lock")
+                    {
+                        continue;
+                    }
+                    let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                        continue;
+                    };
+                    if crate::database::validate_id(thread_id).is_err()
+                        || leased_threads.contains(thread_id)
+                    {
+                        continue;
+                    }
+                    results.push(AppServerDiagnostic {
+                        codex_home: home.to_string_lossy().into_owned(),
+                        lease_path: None,
+                        owner_pid: None,
+                        child_pid: None,
+                        thread_id: Some(thread_id.into()),
+                        owner_alive: false,
+                        child_alive: false,
+                        identity_matches: false,
+                        lock_present: true,
+                        state: "unowned_lock".into(),
+                    });
+                }
+            }
+        }
+        Ok(AppServerDiagnosticPage {
+            items: results,
+            truncated,
+        })
+    })
+    .await
+    .map_err(|_| Error::Closed)?
+}
+
+pub async fn app_server_diagnostics(data: &Path) -> Result<Vec<AppServerDiagnostic>> {
+    Ok(app_server_diagnostics_page(data).await?.items)
+}
+
+#[derive(Clone)]
+pub(crate) struct AppServerCleanup {
+    child_pid: u32,
+    codex_home: Option<PathBuf>,
+    lease_path: Option<PathBuf>,
+}
+
+impl AppServerCleanup {
+    pub(crate) fn new(
+        data: &Path,
+        child_pid: u32,
+        environment: &[(String, String)],
+    ) -> Result<Self> {
+        let codex_home = owned_codex_home_from_environment(data, environment);
+        let lease_path = match codex_home.as_ref() {
+            Some(home) => Some(write_app_server_lease(home, child_pid)?),
+            None => None,
+        };
+        Ok(Self {
+            child_pid,
+            codex_home,
+            lease_path,
+        })
+    }
+
+    pub(crate) fn record_thread(&self, thread_id: &str) {
+        if let Some(path) = self.lease_path.as_ref() {
+            update_app_server_lease(path, self.child_pid, thread_id);
+        }
+    }
+
+    pub(crate) fn cleanup_thread_lock(&self, thread_id: &str) {
+        if process_alive(self.child_pid) {
+            return;
+        }
+        if let Some(home) = self.codex_home.as_deref()
+            && !other_thread_lease_alive(home, thread_id, self.child_pid)
+        {
+            cleanup_thread_writer_lock(Some(home), thread_id);
+        }
+    }
+
+    pub(crate) async fn terminate(&self, child: &mut Child) {
+        kill_process_group(self.child_pid);
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        if !process_alive(self.child_pid)
+            && let Some(path) = self.lease_path.as_ref()
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_for(home: &Path) -> Vec<(String, String)> {
+        vec![("CODEX_HOME".into(), home.to_string_lossy().into_owned())]
+    }
+
+    #[cfg(unix)]
+    fn cleanup_home() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::TempDir::new().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join(".prospero/app-server-leases")).unwrap();
+        std::fs::create_dir_all(home.join("thread-writer-locks")).unwrap();
+        (root, home)
+    }
+
+    #[cfg(unix)]
+    fn process_group() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn process_group_with_term_ignoring_descendant(directory: &Path) -> (std::process::Child, u32) {
+        use std::os::unix::process::CommandExt;
+
+        let script = r#"import subprocess,sys,time
+subprocess.Popen([sys.executable,'-c','import os,pathlib,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path("grandchild").write_text(str(os.getpid())); time.sleep(30)'])
+while True: time.sleep(1)
+"#;
+        let mut command = std::process::Command::new("python3");
+        command.args(["-c", script]).current_dir(directory);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let path = directory.join("grandchild");
+        for _ in 0..200 {
+            if let Ok(pid) = std::fs::read_to_string(&path) {
+                return (child, pid.parse().unwrap());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        kill_process_group(child.id());
+        let _ = child.wait();
+        panic!("grandchild did not start");
+    }
+
+    #[cfg(unix)]
+    fn write_test_lease(
+        home: &Path,
+        child_pid: u32,
+        owner_pid: u32,
+        identity: Value,
+        thread_id: Value,
+    ) -> PathBuf {
+        let path = app_server_lease_dir(home).join(format!("{child_pid}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "version": APP_SERVER_LEASE_VERSION,
+                "ownerPid": owner_pid,
+                "childPid": child_pid,
+                "childIdentity": identity,
+                "processGroup": child_pid,
+                "threadId": thread_id,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn stop_process_group(child: &mut std::process::Child) {
+        kill_process_group(child.id());
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn owned_codex_home_accepts_only_daemon_account_roots() {
+        let data = tempfile::TempDir::new().unwrap();
+        let native = data
+            .path()
+            .join("agent-accounts")
+            .join("codex-usage")
+            .join(super::super::usage::NATIVE_CODEX_ID)
+            .join("home");
+        let managed = data
+            .path()
+            .join("agent-accounts")
+            .join("codex")
+            .join("acct");
+        let nested = managed.join("nested");
+        let outside = tempfile::TempDir::new().unwrap();
+        for dir in [&native, &managed, &nested] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        assert_eq!(
+            owned_codex_home_from_environment(data.path(), &env_for(&native)).as_deref(),
+            Some(native.canonicalize().unwrap().as_path())
+        );
+        assert_eq!(
+            owned_codex_home_from_environment(data.path(), &env_for(&managed)).as_deref(),
+            Some(managed.canonicalize().unwrap().as_path())
+        );
+        assert!(owned_codex_home_from_environment(data.path(), &env_for(&nested)).is_none());
+        assert!(owned_codex_home_from_environment(data.path(), &env_for(outside.path())).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_codex_home_rejects_symlinked_account_root() {
+        use std::os::unix::fs::symlink;
+
+        let data = tempfile::TempDir::new().unwrap();
+        let target = tempfile::TempDir::new().unwrap();
+        let link = data
+            .path()
+            .join("agent-accounts")
+            .join("codex")
+            .join("acct");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(target.path(), &link).unwrap();
+
+        assert!(owned_codex_home_from_environment(data.path(), &env_for(&link)).is_none());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_report_unowned_lock_without_removing_it() {
+        let data = tempfile::TempDir::new().unwrap();
+        let home = data
+            .path()
+            .join("agent-accounts")
+            .join("codex-usage")
+            .join(super::super::usage::NATIVE_CODEX_ID)
+            .join("home");
+        std::fs::create_dir_all(home.join("thread-writer-locks")).unwrap();
+        let lock = home.join("thread-writer-locks/thread-unowned.lock");
+        std::fs::write(&lock, []).unwrap();
+        let diagnostics = app_server_diagnostics(data.path()).await.unwrap();
+        let diagnostic = diagnostics
+            .iter()
+            .find(|value| value.thread_id.as_deref() == Some("thread-unowned"))
+            .unwrap();
+        assert_eq!(diagnostic.state, "unowned_lock");
+        assert!(diagnostic.lease_path.is_none());
+        assert!(diagnostic.lock_present);
+        assert!(lock.exists());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_page_caps_total_scanned_entries() {
+        let data = tempfile::TempDir::new().unwrap();
+        let locks = data
+            .path()
+            .join("agent-accounts")
+            .join("codex-usage")
+            .join(super::super::usage::NATIVE_CODEX_ID)
+            .join("home/thread-writer-locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        for index in 0..257 {
+            std::fs::write(locks.join(format!("thread-{index}.lock")), []).unwrap();
+        }
+        let page = app_server_diagnostics_page(data.path()).await.unwrap();
+        assert!(page.truncated);
+        assert_eq!(page.items.len(), 256);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_preserves_live_owner_and_identity_mismatch() {
+        let (_root, home) = cleanup_home();
+        let mut child = process_group();
+        let pid = child.id();
+        let identity = process_identity(pid).unwrap();
+        let lease = write_test_lease(
+            &home,
+            pid,
+            std::process::id(),
+            json!(identity),
+            json!("thread-live"),
+        );
+        let lock = home.join("thread-writer-locks/thread-live.lock");
+        std::fs::write(&lock, []).unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 0);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(lease.exists());
+        assert!(lock.exists());
+        std::fs::write(
+            &lease,
+            serde_json::to_vec(&json!({
+                "version": APP_SERVER_LEASE_VERSION,
+                "ownerPid": 999_999_999_u32,
+                "childPid": pid,
+                "childIdentity": "wrong identity",
+                "processGroup": pid,
+                "threadId": "thread-live",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 0);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(lease.exists());
+        assert!(lock.exists());
+        stop_process_group(&mut child);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_preserves_malformed_lease() {
+        let (_root, home) = cleanup_home();
+        let mut child = process_group();
+        let pid = child.id();
+        let identity = process_identity(pid).unwrap();
+        let lease = write_test_lease(&home, pid, 999_999_999, json!(identity), json!(42));
+        let lock = home.join("thread-writer-locks/thread-malformed.lock");
+        std::fs::write(&lock, []).unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 0);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(lease.exists());
+        assert!(lock.exists());
+        let no_extension = lease.with_extension("");
+        std::fs::rename(&lease, &no_extension).unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 0);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(no_extension.exists());
+        assert!(lock.exists());
+        stop_process_group(&mut child);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_preserves_unsafe_thread_locks() {
+        use std::os::unix::fs::symlink;
+
+        let (_root, home) = cleanup_home();
+        let mut child = process_group();
+        let pid = child.id();
+        let lease = write_test_lease(
+            &home,
+            pid,
+            999_999_999,
+            json!(process_identity(pid).unwrap()),
+            json!("thread-unsafe"),
+        );
+        let locks = home.join("thread-writer-locks");
+        std::fs::remove_dir(&locks).unwrap();
+        let target = tempfile::TempDir::new().unwrap();
+        symlink(target.path(), &locks).unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 0);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(lease.exists());
+        std::fs::remove_file(&locks).unwrap();
+        std::fs::create_dir(&locks).unwrap();
+        symlink(
+            target.path().join("target"),
+            locks.join("thread-unsafe.lock"),
+        )
+        .unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 0);
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(lease.exists());
+        stop_process_group(&mut child);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_terminates_verified_child_and_removes_lock() {
+        let (_root, home) = cleanup_home();
+        let mut child = process_group();
+        let pid = child.id();
+        let lease = write_test_lease(
+            &home,
+            pid,
+            999_999_999,
+            json!(process_identity(pid).unwrap()),
+            json!("thread-stale"),
+        );
+        let lock = home.join("thread-writer-locks/thread-stale.lock");
+        std::fs::write(&lock, []).unwrap();
+        assert_eq!(cleanup_stale_app_servers_in_home(&home), 1);
+        child.wait().unwrap();
+        assert!(!lease.exists());
+        assert!(!lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_terminates_verified_group_after_leader_exits() {
+        let (root, home) = cleanup_home();
+        let (mut child, grandchild) = process_group_with_term_ignoring_descendant(root.path());
+        let pid = child.id();
+        let lease = write_test_lease(
+            &home,
+            pid,
+            999_999_999,
+            json!(process_identity(pid).unwrap()),
+            json!("thread-group"),
+        );
+        let lock = home.join("thread-writer-locks/thread-group.lock");
+        std::fs::write(&lock, []).unwrap();
+        let cleaned = cleanup_stale_app_servers_in_home(&home);
+        let _ = child.wait();
+        for _ in 0..100 {
+            if !process_alive(grandchild) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_alive = process_alive(grandchild);
+        let lease_exists = lease.exists();
+        let lock_exists = lock.exists();
+        if group_alive(pid) {
+            kill_process_group(pid);
+        }
+        assert_eq!(cleaned, 1);
+        assert!(!descendant_alive);
+        assert!(!lease_exists);
+        assert!(!lock_exists);
+    }
+}
+
+pub(super) struct CodexTurn {
+    stdin: mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+    events: Option<mpsc::Receiver<AdapterEvent>>,
+    thread_id: String,
+    current_turn: Arc<Mutex<Option<String>>>,
+    current_turns: Arc<Mutex<HashMap<String, String>>>,
+    approval_policy: Value,
+    sandbox_policy: Value,
+    model: Option<String>,
+    effort: Option<String>,
+    mode: PermissionMode,
+    child_pid: u32,
+    responses: PendingResponses,
+    diagnostics: ProcessDiagnostics,
+}
+
+#[derive(Clone)]
+struct ProcessDiagnostics {
+    file: String,
+    args: Vec<String>,
+    cwd: String,
+    env: Vec<(String, String)>,
+    stderr_tail: StderrTail,
+}
+
+struct StartingRpc {
+    child: Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: BufReader<tokio::process::ChildStdout>,
+    next_id: u64,
+    diagnostics: ProcessDiagnostics,
+    cleanup: AppServerCleanup,
+}
+
+impl StartingRpc {
+    async fn start(
+        data: &Path,
+        workspace: &str,
+        environment: &[(String, String)],
+        app_server_args: &[String],
+    ) -> Result<Self> {
+        preflight_app_servers(data, environment).await?;
+        let file = binary();
+        let mut args = vec!["app-server".to_owned()];
+        args.extend(app_server_args.iter().cloned());
+        let diagnostics = ProcessDiagnostics {
+            file: file.clone(),
+            args: args.clone(),
+            cwd: workspace.to_owned(),
+            env: environment.to_vec(),
+            stderr_tail: Arc::new(Mutex::new(String::new())),
+        };
+        let mut command = Command::new(&file);
+        command
+            .args(&args)
+            .current_dir(workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(false);
+        for (key, value) in environment {
+            command.env(key, value);
+        }
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::Feature("agent_unavailable".into(), "未安装 codex".into())
+            } else {
+                Error::Invalid(diagnostic_message_sync(
+                    &diagnostics,
+                    &format!("codex app-server 启动失败: {error}"),
+                ))
+            }
+        })?;
+        let child_pid = child.id().ok_or(Error::Closed)?;
+        let cleanup = match AppServerCleanup::new(data, child_pid, environment) {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                kill_process_group(child_pid);
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                return Err(error);
+            }
+        };
+        if let Some(stderr) = child.stderr.take() {
+            spawn_stderr_tail_drain(stderr, diagnostics.stderr_tail.clone());
+        }
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                cleanup.terminate(&mut child).await;
+                return Err(Error::Closed);
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                cleanup.terminate(&mut child).await;
+                return Err(Error::Closed);
+            }
+        };
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+            diagnostics,
+            cleanup,
+        })
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        write_frame(
+            &mut self.stdin,
+            &json!({ "jsonrpc": "2.0", "method": method, "params": params }),
+        )
+        .await
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        write_frame(
+            &mut self.stdin,
+            &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+        )
+        .await?;
+        match tokio::time::timeout(
+            START_TIMEOUT,
+            read_response(&mut self.stdout, id, method, &self.diagnostics),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(Error::Invalid(
+                diagnostic_message(&self.diagnostics, &format!("codex {method} 超时")).await,
+            )),
+        }
+    }
+}
+
+async fn write_frame(stdin: &mut tokio::process::ChildStdin, frame: &Value) -> Result<()> {
+    let mut bytes = serde_json::to_vec(frame)?;
+    bytes.push(b'\n');
+    stdin.write_all(&bytes).await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+async fn read_response(
+    stdout: &mut BufReader<tokio::process::ChildStdout>,
+    id: u64,
+    method: &str,
+    diagnostics: &ProcessDiagnostics,
+) -> Result<Value> {
+    loop {
+        let mut line = String::new();
+        let n = stdout.read_line(&mut line).await?;
+        if n == 0 {
+            return Err(Error::Invalid(
+                diagnostic_message(
+                    diagnostics,
+                    &format!("codex {method} 失败: app-server stdout 已关闭"),
+                )
+                .await,
+            ));
+        }
+        if line.len() > MAX_LINE_BYTES {
+            return Err(Error::Invalid("codex response too large".into()));
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("id").and_then(Value::as_u64) != Some(id) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            return Err(Error::Invalid(
+                rpc_error_message(Some(method), error, diagnostics).await,
+            ));
+        }
+        return Ok(value.get("result").cloned().unwrap_or_else(|| json!({})));
+    }
+}
+
+pub(super) async fn spawn_turn(
+    data: &Path,
+    workspace: &str,
+    prompt: &str,
+    native_id: Option<&str>,
+    options: &TurnOptions,
+) -> Result<CodexTurn> {
+    let (environment, app_server_args) = if let Some(profile) = options.api_profile.as_ref() {
+        if profile.protocol() != "openai_responses" {
+            return Err(Error::Invalid(
+                "Codex structured runtime 仅支持 OpenAI Responses Profile".into(),
+            ));
+        }
+        (
+            options.environment.clone(),
+            crate::accounts::profile::codex_app_server_args(profile),
+        )
+    } else {
+        let (_home, environment) = super::usage::native_codex_environment(data)?;
+        (environment, Vec::new())
+    };
+    let mut rpc = StartingRpc::start(data, workspace, &environment, &app_server_args).await?;
+    let child_pid = rpc.cleanup.child_pid;
+    let policy = execution_policy(workspace, options.policy);
+    let startup = async {
+        rpc.request(
+            "initialize",
+            json!({
+                "clientInfo": { "name": "prospero", "title": "Prospero", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true, "requestAttestation": false },
+            }),
+        )
+        .await?;
+        rpc.notify("initialized", json!({})).await?;
+
+        let mut base = serde_json::Map::new();
+        base.insert("cwd".into(), json!(workspace));
+        base.insert("approvalPolicy".into(), policy.approval_policy.clone());
+        base.insert("sandbox".into(), policy.sandbox.clone());
+        base.insert(
+            "developerInstructions".into(),
+            json!(crate::cross_model_tool::CODEX_DEVELOPER_INSTRUCTIONS),
+        );
+        if let Some(model) = options.model.as_ref() {
+            base.insert("model".into(), json!(model));
+        }
+        let started = if let Some(thread_id) = native_id {
+            let mut params = base.clone();
+            params.insert("threadId".into(), json!(thread_id));
+            match rpc.request("thread/resume", Value::Object(params)).await {
+                Ok(value) => value,
+                Err(Error::Invalid(message))
+                    if message.to_ascii_lowercase().contains("no rollout found") =>
+                {
+                    rpc.request("thread/start", Value::Object(base)).await?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            rpc.request("thread/start", Value::Object(base)).await?
+        };
+        started
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .or_else(|| started.get("threadId"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| Error::Invalid("codex thread/start 未返回 threadId".into()))
+    }
+    .await;
+    let thread_id = match startup {
+        Ok(thread_id) => thread_id,
+        Err(error) => {
+            rpc.cleanup.terminate(&mut rpc.child).await;
+            return Err(error);
+        }
+    };
+    rpc.cleanup.record_thread(&thread_id);
+
+    let (frames_tx, mut frames_rx) = mpsc::channel::<(Value, Option<oneshot::Sender<()>>)>(32);
+    let (events_tx, events_rx) = mpsc::channel::<AdapterEvent>(64);
+    let responses: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+    let _ = events_tx.try_send(AdapterEvent::NativeId(thread_id.clone()));
+    let current_turn = Arc::new(Mutex::new(None));
+    let current_turns = Arc::new(Mutex::new(HashMap::new()));
+
+    let mut stdin = rpc.stdin;
+    tokio::spawn(async move {
+        while let Some((frame, ack)) = frames_rx.recv().await {
+            if write_frame(&mut stdin, &frame).await.is_err() {
+                break;
+            }
+            if let Some(ack) = ack {
+                let _ = ack.send(());
+            }
+        }
+    });
+
+    let reader_current_turn = current_turn.clone();
+    let reader_current_turns = current_turns.clone();
+    let reader_frames = frames_tx.clone();
+    let reader_thread_id = thread_id.clone();
+    let cleanup_thread_id = reader_thread_id.clone();
+    let reader_responses = responses.clone();
+    let diagnostics = rpc.diagnostics.clone();
+    let cleanup = rpc.cleanup.clone();
+    let reader_diagnostics = diagnostics.clone();
+    let auto_approve = options.policy == ApprovalPolicy::Auto;
+    tokio::spawn(async move {
+        read_notifications(
+            rpc.stdout,
+            events_tx,
+            reader_frames,
+            auto_approve,
+            reader_thread_id,
+            NotificationState {
+                current_turn: reader_current_turn,
+                current_turns: reader_current_turns,
+                responses: reader_responses,
+                diagnostics: reader_diagnostics,
+            },
+        )
+        .await;
+        cleanup.terminate(&mut rpc.child).await;
+        cleanup.cleanup_thread_lock(&cleanup_thread_id);
+    });
+
+    let turn_start_id = 1_000_000_u64;
+    let mut turn_params = serde_json::Map::new();
+    turn_params.insert("threadId".into(), json!(thread_id));
+    turn_params.insert(
+        "input".into(),
+        json!([{ "type": "text", "text": prompt, "text_elements": [] }]),
+    );
+    turn_params.insert(
+        "approvalPolicy".into(),
+        policy.approval_policy_for_turn.clone(),
+    );
+    turn_params.insert("sandboxPolicy".into(), policy.sandbox_policy.clone());
+    if let Some(model) = options.model.as_ref() {
+        turn_params.insert("model".into(), json!(model));
+        turn_params.insert("collaborationMode".into(), collaboration_mode(options));
+    }
+    if let Some(effort) = options.effort.as_ref() {
+        turn_params.insert("effort".into(), json!(effort));
+    }
+    let turn_params = Value::Object(turn_params);
+    responses.lock().await.insert(
+        turn_start_id.to_string(),
+        PendingResponse::FinishOnError {
+            method: "turn/start".into(),
+            subagent: None,
+            retry_params: alternate_turn_start_params(&turn_params),
+        },
+    );
+    if frames_tx
+        .try_send((
+            json!({ "jsonrpc": "2.0", "id": turn_start_id, "method": "turn/start", "params": turn_params }),
+            None,
+        ))
+        .is_err()
+    {
+        responses.lock().await.remove(&turn_start_id.to_string());
+        return Err(Error::Invalid(
+            diagnostic_message(&diagnostics, "codex turn/start 失败: app-server 队列不可写").await,
+        ));
+    }
+
+    Ok(CodexTurn {
+        stdin: frames_tx,
+        events: Some(events_rx),
+        thread_id,
+        current_turn,
+        current_turns,
+        approval_policy: policy.approval_policy_for_turn,
+        sandbox_policy: policy.sandbox_policy,
+        model: options.model.clone(),
+        effort: options.effort.clone(),
+        mode: options.mode,
+        child_pid,
+        responses,
+        diagnostics,
+    })
+}
+
+pub(super) async fn read_subagent_history_once(
+    data: &Path,
+    workspace: &str,
+    parent_thread_id: &str,
+    subagent_id: &str,
+) -> Result<Option<Vec<Value>>> {
+    let (_home, environment) = super::usage::native_codex_environment(data)?;
+    let mut rpc = StartingRpc::start(data, workspace, &environment, &[]).await?;
+    let result = async {
+        rpc.request(
+            "initialize",
+            json!({
+                "clientInfo": { "name": "prospero", "title": "Prospero", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true, "requestAttestation": false },
+            }),
+        )
+        .await?;
+        rpc.notify("initialized", json!({})).await?;
+        let _ = rpc
+            .request(
+                "thread/resume",
+                json!({
+                    "threadId": parent_thread_id,
+                    "cwd": workspace,
+                    "approvalPolicy": "untrusted",
+                    "sandbox": "workspace-write",
+                }),
+            )
+            .await?;
+        let raw = rpc
+            .request(
+                "thread/read",
+                json!({ "threadId": subagent_id, "includeTurns": true }),
+            )
+            .await?;
+        let Some(thread) = raw.get("thread").and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        if thread.get("id").and_then(Value::as_str) != Some(subagent_id)
+            || thread.get("parentThreadId").and_then(Value::as_str) != Some(parent_thread_id)
+        {
+            return Err(Error::Invalid("Codex 返回的线程不属于当前父会话".into()));
+        }
+        Ok(Some(history_events(thread, subagent_id)))
+    }
+    .await;
+    rpc.cleanup.terminate(&mut rpc.child).await;
+    result
+}
+
+struct ExecutionPolicy {
+    approval_policy: Value,
+    approval_policy_for_turn: Value,
+    sandbox: Value,
+    sandbox_policy: Value,
+}
+
+fn execution_policy(workspace: &str, policy: ApprovalPolicy) -> ExecutionPolicy {
+    if policy == ApprovalPolicy::Auto {
+        ExecutionPolicy {
+            approval_policy: json!("never"),
+            approval_policy_for_turn: json!("never"),
+            sandbox: json!("danger-full-access"),
+            sandbox_policy: json!({ "type": "danger-full-access" }),
+        }
+    } else {
+        ExecutionPolicy {
+            approval_policy: json!("untrusted"),
+            approval_policy_for_turn: json!("untrusted"),
+            sandbox: json!("workspace-write"),
+            sandbox_policy: json!({ "type": "workspace-write", "writable_roots": [workspace] }),
+        }
+    }
+}
+
+fn collaboration_mode(options: &TurnOptions) -> Value {
+    json!({
+        "mode": if options.mode == PermissionMode::Plan { "plan" } else { "default" },
+        "settings": {
+            "model": options.model.as_deref().unwrap_or(""),
+            "reasoning_effort": options.effort,
+            "developer_instructions": null,
+        }
+    })
+}
+
+async fn read_notifications(
+    mut stdout: BufReader<tokio::process::ChildStdout>,
+    events: mpsc::Sender<AdapterEvent>,
+    writer: mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+    auto_approve: bool,
+    root_thread_id: String,
+    state: NotificationState,
+) {
+    let mut streamed: HashMap<String, String> = HashMap::new();
+    let mut subagents: HashMap<String, bool> = HashMap::new();
+    let mut pending_diffs: HashMap<String, crate::protocol::FileDiff> = HashMap::new();
+    let mut turn_diffs: HashMap<String, crate::protocol::FileDiff> = HashMap::new();
+    let mut aggregate_diffs: Option<Vec<crate::protocol::FileDiff>> = None;
+    let mut last_text: Option<String> = None;
+    let mut last_input_tokens: Option<i64> = None;
+    let mut last_output_tokens: Option<i64> = None;
+    let mut sent_finish = false;
+    loop {
+        let mut line = String::new();
+        let Ok(n) = stdout.read_line(&mut line).await else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        if line.len() > MAX_LINE_BYTES {
+            let _ = events
+                .send(AdapterEvent::Finish {
+                    interrupted: false,
+                    error: Some(
+                        diagnostic_message(&state.diagnostics, "codex response too large").await,
+                    ),
+                    cost_usd: None,
+                    input_tokens: last_input_tokens,
+                    output_tokens: last_output_tokens,
+                    diffs: Vec::new(),
+                })
+                .await;
+            sent_finish = true;
+            break;
+        }
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if message.get("method").is_none() {
+            if let Some(id) = rpc_id_key(message.get("id")) {
+                let pending = state.responses.lock().await.remove(&id);
+                if let Some(pending) = pending {
+                    match pending {
+                        PendingResponse::Reply { method, tx } => {
+                            let result = if let Some(error) = message.get("error") {
+                                Err(rpc_error_message(Some(&method), error, &state.diagnostics)
+                                    .await)
+                            } else {
+                                Ok(message.get("result").cloned().unwrap_or_else(|| json!({})))
+                            };
+                            let _ = tx.send(result);
+                        }
+                        PendingResponse::FinishOnError {
+                            method,
+                            subagent,
+                            retry_params,
+                        } => {
+                            if let Some(error) = message.get("error") {
+                                if let Some(params) = retry_params
+                                    && sandbox_policy_schema_error(error)
+                                    && retry_turn_start(
+                                        &writer,
+                                        &state.responses,
+                                        method.clone(),
+                                        subagent.clone(),
+                                        params,
+                                    )
+                                    .await
+                                {
+                                    continue;
+                                }
+                                let text =
+                                    rpc_error_message(Some(&method), error, &state.diagnostics)
+                                        .await;
+                                if let Some(subagent) = subagent {
+                                    let _ = events
+                                        .send(AdapterEvent::SubagentUpdate {
+                                            subagent,
+                                            status: "failed",
+                                            can_message: false,
+                                            summary: Some(text),
+                                        })
+                                        .await;
+                                } else {
+                                    let _ = events
+                                        .send(AdapterEvent::Finish {
+                                            interrupted: false,
+                                            error: Some(text),
+                                            cost_usd: None,
+                                            input_tokens: last_input_tokens,
+                                            output_tokens: last_output_tokens,
+                                            diffs: Vec::new(),
+                                        })
+                                        .await;
+                                    sent_finish = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(error) = message.get("error") {
+            let text = rpc_error_message(None, error, &state.diagnostics).await;
+            let _ = events
+                .send(AdapterEvent::Finish {
+                    interrupted: false,
+                    error: Some(text),
+                    cost_usd: None,
+                    input_tokens: last_input_tokens,
+                    output_tokens: last_output_tokens,
+                    diffs: Vec::new(),
+                })
+                .await;
+            sent_finish = true;
+            break;
+        }
+        let Some(method) = message.get("method").and_then(Value::as_str) else {
+            continue;
+        };
+        let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+        let notification_thread = params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .unwrap_or(&root_thread_id);
+        let agent_id = (notification_thread != root_thread_id
+            && subagents.contains_key(notification_thread))
+        .then(|| notification_thread.to_owned());
+        if message.get("id").is_some() {
+            handle_request(
+                message.get("id").cloned().unwrap_or(Value::Null),
+                method,
+                &params,
+                &events,
+                &writer,
+                auto_approve,
+            )
+            .await;
+            continue;
+        }
+        match method {
+            "thread/started" => {
+                let thread = params.get("thread").cloned().unwrap_or_else(|| json!({}));
+                let id = thread.get("id").and_then(Value::as_str).unwrap_or_default();
+                let parent = thread
+                    .get("parentThreadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !id.is_empty() && parent == root_thread_id {
+                    subagents.insert(id.to_owned(), true);
+                    let name = thread
+                        .get("agentNickname")
+                        .or_else(|| thread.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Codex subagent")
+                        .chars()
+                        .take(120)
+                        .collect::<String>();
+                    let role = thread
+                        .get("agentRole")
+                        .and_then(Value::as_str)
+                        .map(|value| value.chars().take(200).collect::<String>());
+                    let task = thread
+                        .get("preview")
+                        .and_then(Value::as_str)
+                        .map(|value| value.chars().take(1000).collect::<String>());
+                    let _ = events
+                        .send(AdapterEvent::SubagentStarted {
+                            subagent: id.to_owned(),
+                            name,
+                            role,
+                            task,
+                        })
+                        .await;
+                }
+            }
+            "thread/status/changed" => {
+                let id = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !id.is_empty() && subagents.contains_key(id) {
+                    let (status, can_message) = subagent_status(params.get("status"));
+                    let _ = events
+                        .send(AdapterEvent::SubagentUpdate {
+                            subagent: id.to_owned(),
+                            status,
+                            can_message,
+                            summary: None,
+                        })
+                        .await;
+                }
+            }
+            "turn/started" => {
+                let turn_id = params
+                    .get("turn")
+                    .and_then(|turn| turn.get("id"))
+                    .or_else(|| params.get("turnId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if notification_thread == root_thread_id {
+                    *state.current_turn.lock().await = turn_id;
+                    last_text = None;
+                    streamed.clear();
+                } else if let Some(turn_id) = turn_id {
+                    state
+                        .current_turns
+                        .lock()
+                        .await
+                        .insert(notification_thread.to_owned(), turn_id);
+                }
+            }
+            "item/agentMessage/delta" | "item/plan/delta" => {
+                if let Some(delta) = params.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
+                {
+                    let msg_id = codex_item_id(&params, &state.current_turn).await;
+                    last_text = Some(msg_id.clone());
+                    let full = streamed.entry(msg_id.clone()).or_default();
+                    full.push_str(delta);
+                    let _ = events
+                        .send(AdapterEvent::Text {
+                            subagent: agent_id.clone(),
+                            text: full.clone(),
+                        })
+                        .await;
+                }
+            }
+            "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+                if let Some(delta) = params.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
+                {
+                    let _ = events
+                        .send(AdapterEvent::Thinking {
+                            subagent: agent_id.clone(),
+                            text: delta.to_owned(),
+                        })
+                        .await;
+                }
+            }
+            "item/started" => {
+                let item = params.get("item").cloned().unwrap_or_else(|| json!({}));
+                let item_type = item_type(&item);
+                let item_id = codex_item_id_from_item(&params, &item).unwrap_or_else(|| {
+                    futures_current_turn(&state.current_turn).unwrap_or_else(|| "codex-tool".into())
+                });
+                if item_type == "collabAgentToolCall" {
+                    // The item names the child thread before thread/started
+                    // carries richer metadata. Remember it now so attributed
+                    // deltas route to the subagent; a later status/completion
+                    // update will create a minimal card if thread/started does
+                    // not arrive on this app-server version.
+                    for receiver in receiver_thread_ids(&item) {
+                        subagents.insert(receiver, true);
+                    }
+                    continue;
+                }
+                if let Some((tool, summary)) = tool_start_summary(&item_type, &item) {
+                    let diff = codex_file_changes(&item).into_iter().next();
+                    let _ = events
+                        .send(AdapterEvent::ToolCall {
+                            subagent: agent_id.clone(),
+                            call_id: item_id,
+                            name: tool,
+                            summary,
+                            diff,
+                        })
+                        .await;
+                }
+            }
+            "item/fileChange/patchUpdated" => {
+                let item_id = params
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if !item_id.is_empty()
+                    && let Some(diff) = extract_diff(&params)
+                {
+                    pending_diffs.insert(item_id, diff);
+                }
+            }
+            "turn/diff/updated" => {
+                if let Some(patch) = params.get("diff").and_then(Value::as_str)
+                    && !patch.is_empty()
+                {
+                    aggregate_diffs = Some(codex_turn_diffs(patch));
+                }
+            }
+            "item/completed" => {
+                let item = params.get("item").cloned().unwrap_or_else(|| json!({}));
+                let item_type = item_type(&item);
+                if item_type == "agentMessage" || item_type == "plan" {
+                    let msg_id = item
+                        .get("id")
+                        .or_else(|| params.get("itemId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            last_text.clone().unwrap_or_else(|| "codex-message".into())
+                        });
+                    last_text = Some(msg_id.clone());
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        let seen = streamed.remove(&msg_id).unwrap_or_default();
+                        if text != seen {
+                            let _ = events
+                                .send(AdapterEvent::Text {
+                                    subagent: agent_id.clone(),
+                                    text: text.to_owned(),
+                                })
+                                .await;
+                        }
+                    }
+                } else if item_type == "collabAgentToolCall" {
+                    let raw = item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed");
+                    let status = if raw == "failed" {
+                        "failed"
+                    } else {
+                        "completed"
+                    };
+                    for receiver in receiver_thread_ids(&item) {
+                        if subagents.contains_key(&receiver) {
+                            let _ = events
+                                .send(AdapterEvent::SubagentUpdate {
+                                    subagent: receiver,
+                                    status,
+                                    can_message: false,
+                                    summary: None,
+                                })
+                                .await;
+                        }
+                    }
+                } else if let Some((tool, summary, error, has_more)) =
+                    tool_result_summary(&item_type, &item)
+                {
+                    let item_id = codex_item_id_from_item(&params, &item).unwrap_or_else(|| {
+                        futures_current_turn(&state.current_turn)
+                            .unwrap_or_else(|| "codex-tool".into())
+                    });
+                    let changes = codex_file_changes(&item);
+                    let diff = changes
+                        .first()
+                        .cloned()
+                        .or_else(|| pending_diffs.remove(&item_id));
+                    if item_type == "fileChange" && !error {
+                        for change in changes.into_iter().chain(diff.clone()) {
+                            turn_diffs.insert(change.path.clone(), change);
+                        }
+                    }
+                    let _ = events
+                        .send(AdapterEvent::ToolResult {
+                            subagent: agent_id.clone(),
+                            call_id: item_id,
+                            name: tool,
+                            summary,
+                            error,
+                            diff,
+                            has_more,
+                        })
+                        .await;
+                }
+            }
+            "thread/tokenUsage/updated" => {
+                let last = params
+                    .get("tokenUsage")
+                    .and_then(|value| value.get("last"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                last_input_tokens = last.get("inputTokens").and_then(Value::as_i64);
+                last_output_tokens = last.get("outputTokens").and_then(Value::as_i64);
+            }
+            "turn/completed" => {
+                if notification_thread != root_thread_id {
+                    state.current_turns.lock().await.remove(notification_thread);
+                    continue;
+                }
+                let turn = params.get("turn").cloned().unwrap_or_else(|| json!({}));
+                let status = turn
+                    .get("status")
+                    .or_else(|| params.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
+                let failed = matches!(status, "failed" | "error");
+                let interrupted = matches!(status, "cancelled" | "canceled" | "interrupted");
+                let diffs = aggregate_diffs
+                    .take()
+                    .unwrap_or_else(|| turn_diffs.values().cloned().collect());
+                let _ = events
+                    .send(AdapterEvent::Finish {
+                        interrupted,
+                        error: failed.then(|| format!("Codex turn {status}")),
+                        cost_usd: None,
+                        input_tokens: last_input_tokens,
+                        output_tokens: last_output_tokens,
+                        diffs,
+                    })
+                    .await;
+                sent_finish = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !sent_finish {
+        let message = diagnostic_message(&state.diagnostics, "codex stream closed").await;
+        fail_pending_responses(&state.responses, message.clone()).await;
+        let _ = events
+            .send(AdapterEvent::Finish {
+                interrupted: false,
+                error: Some(message),
+                cost_usd: None,
+                input_tokens: last_input_tokens,
+                output_tokens: last_output_tokens,
+                diffs: Vec::new(),
+            })
+            .await;
+    }
+}
+
+fn rpc_id_key(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+async fn handle_request(
+    rpc_id: Value,
+    method: &str,
+    params: &Value,
+    events: &mpsc::Sender<AdapterEvent>,
+    writer: &mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+    auto_approve: bool,
+) {
+    if method == "item/tool/requestUserInput" {
+        handle_question_request(rpc_id, params, events, writer).await;
+        return;
+    }
+    let Some(kind) = approval_kind(method) else {
+        respond_error(writer, rpc_id, -32601, format!("prospero 不支持 {method}")).await;
+        return;
+    };
+    let item_id = params
+        .get("itemId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            params
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| params.get("callId").and_then(Value::as_str))
+        .unwrap_or("codex-approval")
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let (tool, action, subject) = approval_summary(method, params);
+    if auto_approve {
+        respond_result(writer, rpc_id, approval_response(kind, true, params)).await;
+        return;
+    }
+    let (reply, reply_rx) = oneshot::channel();
+    if events
+        .send(AdapterEvent::Permission {
+            subagent: None,
+            request_id: item_id,
+            tool,
+            summary: format!("{action}:{subject}"),
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        respond_result(writer, rpc_id, approval_response(kind, false, params)).await;
+        return;
+    }
+    let writer = writer.clone();
+    let params = params.clone();
+    tokio::spawn(async move {
+        let allow = reply_rx.await.unwrap_or(false);
+        respond_result(&writer, rpc_id, approval_response(kind, allow, &params)).await;
+    });
+}
+
+async fn handle_question_request(
+    rpc_id: Value,
+    params: &Value,
+    events: &mpsc::Sender<AdapterEvent>,
+    writer: &mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+) {
+    let item_id = params
+        .get("approvalId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("itemId").and_then(Value::as_str))
+        .or_else(|| params.get("callId").and_then(Value::as_str))
+        .unwrap_or("codex-question")
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let questions = params
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| codex_question(row, index))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if questions.is_empty() {
+        respond_result(writer, rpc_id, json!({ "answers": {} })).await;
+        return;
+    }
+    let (reply, reply_rx) = oneshot::channel();
+    if events
+        .send(AdapterEvent::Question {
+            subagent: None,
+            request_id: item_id,
+            questions,
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        respond_result(writer, rpc_id, json!({ "answers": {} })).await;
+        return;
+    }
+    let writer = writer.clone();
+    tokio::spawn(async move {
+        let mut answers = serde_json::Map::new();
+        if let Ok(QuestionReply {
+            answers: native,
+            cancelled: false,
+        }) = reply_rx.await
+        {
+            for (question_id, answer) in native {
+                let values = answer
+                    .split(", ")
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Value::String(value.to_owned()))
+                    .collect::<Vec<_>>();
+                answers.insert(question_id, json!({ "answers": values }));
+            }
+        }
+        respond_result(&writer, rpc_id, json!({ "answers": answers })).await;
+    });
+}
+
+fn codex_question(row: &Value, index: usize) -> Option<QuestionSpec> {
+    let row = row.as_object()?;
+    let id = row
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("question-{}", index + 1));
+    let question = row
+        .get("question")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("请选择")
+        .chars()
+        .take(1000)
+        .collect::<String>();
+    let header = row
+        .get("header")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Agent 提问")
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let options = row
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|option| {
+                    let option = option.as_object()?;
+                    let label = option.get("label")?.as_str()?.chars().take(200).collect();
+                    let description = option
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(|value| value.chars().take(1000).collect());
+                    Some(QuestionOptionSpec {
+                        label,
+                        description,
+                        preview: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(QuestionSpec {
+        native_question: id.clone(),
+        id,
+        header,
+        question,
+        options,
+        multi_select: row.get("multiSelect").and_then(Value::as_bool) == Some(true),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ApprovalKind {
+    V2CommandOrFile,
+    V2Permissions,
+    Legacy,
+}
+
+fn approval_kind(method: &str) -> Option<ApprovalKind> {
+    match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            Some(ApprovalKind::V2CommandOrFile)
+        }
+        "item/permissions/requestApproval" => Some(ApprovalKind::V2Permissions),
+        "execCommandApproval" | "applyPatchApproval" => Some(ApprovalKind::Legacy),
+        _ => None,
+    }
+}
+
+fn approval_summary(method: &str, params: &Value) -> (String, &'static str, String) {
+    match method {
+        "item/commandExecution/requestApproval" | "execCommandApproval" => {
+            let command = params
+                .get("command")
+                .or_else(|| params.get("parsedCommand"))
+                .or_else(|| params.get("argv"));
+            ("commandExecution".into(), "运行命令", summarize(command))
+        }
+        "item/fileChange/requestApproval" | "applyPatchApproval" => {
+            let reason = params
+                .get("reason")
+                .or_else(|| params.get("grantRoot"))
+                .or_else(|| params.get("changes"))
+                .or_else(|| params.get("fileChanges"));
+            ("fileChange".into(), "修改文件", summarize(reason))
+        }
+        "item/permissions/requestApproval" => {
+            let reason = params.get("reason");
+            ("permissions".into(), "请求额外权限", summarize(reason))
+        }
+        _ => ("tool".into(), "执行操作", summarize(Some(params))),
+    }
+}
+
+fn approval_response(kind: ApprovalKind, allow: bool, params: &Value) -> Value {
+    match kind {
+        ApprovalKind::V2CommandOrFile => {
+            json!({ "decision": if allow { "accept" } else { "decline" } })
+        }
+        ApprovalKind::V2Permissions => {
+            if !allow {
+                json!({ "permissions": {}, "scope": "turn" })
+            } else {
+                let mut permissions = serde_json::Map::new();
+                if let Some(network) = params.get("permissions").and_then(|p| p.get("network"))
+                    && !network.is_null()
+                {
+                    permissions.insert("network".into(), network.clone());
+                }
+                if let Some(file_system) =
+                    params.get("permissions").and_then(|p| p.get("fileSystem"))
+                    && !file_system.is_null()
+                {
+                    permissions.insert("fileSystem".into(), file_system.clone());
+                }
+                json!({ "permissions": permissions, "scope": "turn" })
+            }
+        }
+        ApprovalKind::Legacy => {
+            if allow {
+                json!({ "decision": "approved" })
+            } else {
+                json!({ "decision": { "denied": { "rejection": "用户拒绝了此操作" } } })
+            }
+        }
+    }
+}
+
+async fn respond_result(
+    writer: &mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+    id: Value,
+    result: Value,
+) {
+    let _ = writer
+        .send((
+            json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            None,
+        ))
+        .await;
+}
+
+async fn respond_error(
+    writer: &mpsc::Sender<(Value, Option<oneshot::Sender<()>>)>,
+    id: Value,
+    code: i64,
+    message: String,
+) {
+    let _ = writer
+        .send((
+            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
+            None,
+        ))
+        .await;
+}
+
+fn item_type(item: &Value) -> String {
+    item.get("type")
+        .or_else(|| item.get("item_type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn codex_item_id_from_item(params: &Value, item: &Value) -> Option<String> {
+    item.get("id")
+        .or_else(|| params.get("itemId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(120).collect())
+}
+
+fn tool_start_summary(item_type: &str, item: &Value) -> Option<(String, String)> {
+    match item_type {
+        "commandExecution" => Some(("bash".into(), summarize(item.get("command")))),
+        "fileChange" => Some(("edit".into(), summarize(item.get("changes")))),
+        "mcpToolCall" => Some((
+            item.get("server")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp")
+                .to_owned(),
+            summarize(Some(item)),
+        )),
+        _ => None,
+    }
+}
+
+fn tool_result_summary(item_type: &str, item: &Value) -> Option<(String, String, bool, bool)> {
+    match item_type {
+        "commandExecution" => Some((
+            "bash".into(),
+            summarize(
+                item.get("aggregatedOutput")
+                    .or_else(|| item.get("exitCode"))
+                    .or_else(|| item.get("status")),
+            ),
+            item_failed(item),
+            full_text_len(item) > 400,
+        )),
+        "fileChange" => Some((
+            "edit".into(),
+            summarize(item.get("status")),
+            item_failed(item),
+            false,
+        )),
+        "mcpToolCall" => Some((
+            item.get("server")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp")
+                .to_owned(),
+            summarize(
+                item.get("error")
+                    .or_else(|| item.get("result"))
+                    .or_else(|| item.get("status")),
+            ),
+            item_failed(item),
+            full_text_len(item) > 400,
+        )),
+        _ => None,
+    }
+}
+
+fn receiver_thread_ids(item: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["receiverThreadId", "agentThreadId", "threadId"] {
+        if let Some(value) = item.get(key).and_then(Value::as_str)
+            && !value.is_empty()
+        {
+            out.push(value.chars().take(120).collect());
+        }
+    }
+    for key in ["receiverThreadIds", "agentThreadIds"] {
+        if let Some(items) = item.get(key).and_then(Value::as_array) {
+            out.extend(items.iter().filter_map(|value| {
+                value
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| id.chars().take(120).collect::<String>())
+            }));
+        }
+    }
+    if let Some(states) = item.get("agentsStates").and_then(Value::as_object) {
+        out.extend(
+            states
+                .keys()
+                .map(|key| key.chars().take(120).collect::<String>()),
+        );
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn subagent_status(value: Option<&Value>) -> (&'static str, bool) {
+    let status = value
+        .and_then(|value| {
+            value.as_str().or_else(|| {
+                value
+                    .as_object()
+                    .and_then(|map| map.get("type"))
+                    .and_then(Value::as_str)
+            })
+        })
+        .unwrap_or_default();
+    match status {
+        "active" | "running" | "pendingInit" => ("running", true),
+        "idle" => ("idle", true),
+        "completed" => ("completed", false),
+        "systemError" | "errored" | "notFound" => ("failed", false),
+        "interrupted" | "shutdown" | "notLoaded" => ("stopped", false),
+        _ => ("starting", true),
+    }
+}
+
+fn codex_file_changes(item: &Value) -> Vec<crate::protocol::FileDiff> {
+    item.get("changes")
+        .and_then(Value::as_array)
+        .map(|changes| {
+            changes
+                .iter()
+                .filter_map(|change| {
+                    let path = change.get("path")?.as_str()?;
+                    let patch = change
+                        .get("patch")
+                        .or_else(|| change.get("unifiedDiff"))
+                        .or_else(|| change.get("diff"))
+                        .and_then(Value::as_str)?;
+                    Some(from_unified_patch(path, patch))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn extract_diff(params: &Value) -> Option<crate::protocol::FileDiff> {
+    let path = params
+        .get("path")
+        .or_else(|| params.get("file"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if let Some(patch) = params
+        .get("patch")
+        .or_else(|| params.get("unifiedDiff"))
+        .or_else(|| params.get("diff"))
+        .and_then(Value::as_str)
+        && !patch.is_empty()
+    {
+        return Some(from_unified_patch(path, patch));
+    }
+    let changes = params.get("changes")?.as_object()?;
+    for (path, inner) in changes {
+        let patch = inner
+            .get("patch")
+            .or_else(|| inner.get("unifiedDiff"))
+            .or_else(|| inner.get("diff"))
+            .and_then(Value::as_str);
+        if let Some(patch) = patch
+            && !patch.is_empty()
+        {
+            return Some(from_unified_patch(path, patch));
+        }
+    }
+    None
+}
+
+fn codex_turn_diffs(patch: &str) -> Vec<crate::protocol::FileDiff> {
+    let mut diffs = Vec::new();
+    let mut current = String::new();
+    for line in patch.lines() {
+        if line.starts_with("diff --git ") && !current.is_empty() {
+            if let Some(diff) = diff_from_section(&current) {
+                diffs.push(diff);
+            }
+            current.clear();
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.is_empty()
+        && let Some(diff) = diff_from_section(&current)
+    {
+        diffs.push(diff);
+    }
+    diffs
+}
+
+fn diff_from_section(section: &str) -> Option<crate::protocol::FileDiff> {
+    let mut target = None;
+    let mut binary_target = None;
+    for line in section.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ")
+            && rest != "/dev/null"
+        {
+            target = Some(diff_path(rest));
+        } else if let Some(rest) = line.strip_prefix("--- ")
+            && rest != "/dev/null"
+            && target.is_none()
+        {
+            target = Some(diff_path(rest));
+        } else if let Some(rest) = line.strip_prefix("diff --git ") {
+            binary_target = rest.split_whitespace().last().map(diff_path);
+        }
+    }
+    let path = target.or(binary_target)?.trim().to_owned();
+    if path.is_empty() || path == "/dev/null" {
+        None
+    } else {
+        Some(from_unified_patch(&path, section))
+    }
+}
+
+fn diff_path(value: &str) -> String {
+    value
+        .split('\t')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .trim_matches('"')
+        .trim_start_matches("a/")
+        .trim_start_matches("b/")
+        .to_owned()
+}
+
+fn from_unified_patch(path: &str, patch_text: &str) -> crate::protocol::FileDiff {
+    const MAX_PATCH_CHARS: usize = 8000;
+    let mut additions = 0_i64;
+    let mut deletions = 0_i64;
+    let mut lines = Vec::new();
+    for line in patch_text.lines() {
+        if line.starts_with("---")
+            || line.starts_with("+++")
+            || line.starts_with("diff ")
+            || line.starts_with("index ")
+        {
+            continue;
+        }
+        if line.starts_with('+') {
+            additions += 1;
+        } else if line.starts_with('-') {
+            deletions += 1;
+        }
+        lines.push(line);
+    }
+    let mut patch = lines.join("\n");
+    let truncated = patch.len() > MAX_PATCH_CHARS;
+    if truncated {
+        patch.truncate(MAX_PATCH_CHARS);
+    }
+    crate::protocol::FileDiff {
+        path: path.chars().take(4096).collect(),
+        patch,
+        additions,
+        deletions,
+        truncated,
+    }
+}
+
+fn full_text_len(item: &Value) -> usize {
+    item.get("output")
+        .or_else(|| item.get("aggregatedOutput"))
+        .or_else(|| item.get("result"))
+        .map(|value| match value {
+            Value::String(text) => text.len(),
+            value => serde_json::to_string(value).unwrap_or_default().len(),
+        })
+        .unwrap_or(0)
+}
+
+fn item_failed(item: &Value) -> bool {
+    matches!(
+        item.get("status").and_then(Value::as_str),
+        Some("failed" | "error" | "declined" | "cancelled" | "canceled")
+    ) || item.get("error").is_some_and(|error| !error.is_null())
+}
+
+fn summarize(value: Option<&Value>) -> String {
+    let text = match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| summarize(Some(item)))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+        Some(Value::Null) | None => String::new(),
+        Some(value) => serde_json::to_string(value).unwrap_or_default(),
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        "操作".into()
+    } else {
+        text.chars().take(400).collect()
+    }
+}
+
+async fn codex_item_id(params: &Value, current_turn: &Arc<Mutex<Option<String>>>) -> String {
+    params
+        .get("itemId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| futures_current_turn(current_turn))
+        .unwrap_or_else(|| "codex-message".into())
+}
+
+fn futures_current_turn(current_turn: &Arc<Mutex<Option<String>>>) -> Option<String> {
+    current_turn.try_lock().ok().and_then(|guard| guard.clone())
+}
+
+fn history_events(thread: &serde_json::Map<String, Value>, subagent_id: &str) -> Vec<Value> {
+    let mut events = Vec::new();
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for turn_value in turns {
+        let Some(turn) = turn_value.as_object() else {
+            continue;
+        };
+        let turn_id = turn
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("turn-{}", events.len()));
+        let mut last_message_id = turn_id.clone();
+        let mut final_message_id = None;
+        let mut diffs: HashMap<String, crate::protocol::FileDiff> = HashMap::new();
+        let items = turn
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for item_value in items {
+            let Some(item) = item_value.as_object() else {
+                continue;
+            };
+            let item_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{}-{}", turn_id, events.len()));
+            events.extend(history_item_events(item, &item_id, &turn_id, subagent_id));
+            let typ = item.get("type").and_then(Value::as_str).unwrap_or_default();
+            if typ == "agentMessage" || typ == "plan" {
+                last_message_id = item_id.clone();
+                if item.get("phase").and_then(Value::as_str) == Some("final_answer")
+                    || typ == "plan"
+                {
+                    final_message_id = Some(item_id.clone());
+                }
+            }
+            if typ == "fileChange"
+                && item.get("status").and_then(Value::as_str) == Some("completed")
+            {
+                for diff in codex_file_changes(&Value::Object(item.clone())) {
+                    diffs.insert(diff.path.clone(), diff);
+                }
+            }
+        }
+        let status = turn
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed");
+        if status == "failed" && turn.get("error").is_some_and(|error| !error.is_null()) {
+            events.push(json!({
+                "kind": "agent.error",
+                "message": summarize(turn.get("error")),
+                "agentId": subagent_id,
+            }));
+        }
+        if status != "inProgress" {
+            let mut end = serde_json::Map::new();
+            end.insert("kind".into(), json!("turn.end"));
+            end.insert(
+                "msgId".into(),
+                json!(final_message_id.unwrap_or(last_message_id)),
+            );
+            end.insert("turnId".into(), json!(turn_id));
+            end.insert("finish".into(), json!(status));
+            end.insert("agentId".into(), json!(subagent_id));
+            if !diffs.is_empty() {
+                end.insert(
+                    "diffs".into(),
+                    serde_json::to_value(diffs.into_values().collect::<Vec<_>>())
+                        .unwrap_or_else(|_| json!([])),
+                );
+            }
+            events.push(Value::Object(end));
+        }
+    }
+    events
+}
+
+fn history_item_events(
+    item: &serde_json::Map<String, Value>,
+    item_id: &str,
+    turn_id: &str,
+    subagent_id: &str,
+) -> Vec<Value> {
+    let typ = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    match typ {
+        "userMessage" => {
+            let text = history_user_content(item.get("content"));
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    json!({ "kind": "user.message", "msgId": item_id, "text": text, "agentId": subagent_id }),
+                ]
+            }
+        }
+        "agentMessage" | "plan" => item
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                let mut event = serde_json::Map::new();
+                event.insert("kind".into(), json!("assistant.text"));
+                event.insert("msgId".into(), json!(item_id));
+                event.insert("text".into(), json!(text));
+                event.insert("agentId".into(), json!(subagent_id));
+                if let Some(phase) = item.get("phase").and_then(Value::as_str) {
+                    if phase == "commentary" || phase == "final_answer" {
+                        event.insert("phase".into(), json!(phase));
+                    }
+                } else if typ == "plan" {
+                    event.insert("phase".into(), json!("final_answer"));
+                }
+                vec![Value::Object(event)]
+            })
+            .unwrap_or_default(),
+        "reasoning" => {
+            let text = [item.get("summary"), item.get("content")]
+                .into_iter()
+                .flatten()
+                .flat_map(|value| value.as_array().into_iter().flatten())
+                .filter_map(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    json!({ "kind": "reasoning", "msgId": item_id, "text": text, "agentId": subagent_id }),
+                ]
+            }
+        }
+        "commandExecution" => history_tool_events(HistoryTool {
+            item,
+            item_id,
+            turn_id,
+            subagent_id,
+            tool: "bash".into(),
+            input: summarize(item.get("command")),
+            output: summarize(
+                item.get("aggregatedOutput")
+                    .or_else(|| item.get("exitCode"))
+                    .or_else(|| item.get("status")),
+            ),
+            diff: None,
+        }),
+        "fileChange" => {
+            let changes = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let paths = changes
+                .iter()
+                .filter_map(|change| change.get("path").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let diff = codex_file_changes(&Value::Object(item.clone()))
+                .into_iter()
+                .next();
+            history_tool_events(HistoryTool {
+                item,
+                item_id,
+                turn_id,
+                subagent_id,
+                tool: "edit".into(),
+                input: if paths.is_empty() {
+                    summarize(item.get("changes"))
+                } else {
+                    paths
+                },
+                output: summarize(item.get("status")),
+                diff,
+            })
+        }
+        "mcpToolCall" => {
+            let server = item.get("server").and_then(Value::as_str).unwrap_or("mcp");
+            let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            history_tool_events(HistoryTool {
+                item,
+                item_id,
+                turn_id,
+                subagent_id,
+                tool: format!("{server}.{tool}"),
+                input: summarize(item.get("arguments")),
+                output: summarize(
+                    item.get("error")
+                        .or_else(|| item.get("result"))
+                        .or_else(|| item.get("status")),
+                ),
+                diff: None,
+            })
+        }
+        "dynamicToolCall" => {
+            let namespace = item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("{value}."))
+                .unwrap_or_default();
+            let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            history_tool_events(HistoryTool {
+                item,
+                item_id,
+                turn_id,
+                subagent_id,
+                tool: format!("{namespace}{tool}"),
+                input: summarize(item.get("arguments")),
+                output: summarize(
+                    item.get("contentItems")
+                        .or_else(|| item.get("success"))
+                        .or_else(|| item.get("status")),
+                ),
+                diff: None,
+            })
+        }
+        "collabAgentToolCall" => history_tool_events(HistoryTool {
+            item,
+            item_id,
+            turn_id,
+            subagent_id,
+            tool: format!(
+                "agent.{}",
+                item.get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("collaborate")
+            ),
+            input: summarize(item.get("prompt").or_else(|| item.get("receiverThreadIds"))),
+            output: summarize(item.get("agentsStates").or_else(|| item.get("status"))),
+            diff: None,
+        }),
+        "webSearch" => history_tool_events(HistoryTool {
+            item,
+            item_id,
+            turn_id,
+            subagent_id,
+            tool: "web.search".into(),
+            input: summarize(item.get("query").or_else(|| item.get("action"))),
+            output: {
+                let action = summarize(item.get("action"));
+                if action.trim().is_empty() {
+                    "completed".into()
+                } else {
+                    action
+                }
+            },
+            diff: None,
+        }),
+        "subAgentActivity" | "imageView" | "imageGeneration" => history_tool_events(HistoryTool {
+            item,
+            item_id,
+            turn_id,
+            subagent_id,
+            tool: if typ == "subAgentActivity" {
+                "agent.activity".into()
+            } else {
+                typ.into()
+            },
+            input: item
+                .get("agentThreadId")
+                .or_else(|| item.get("path"))
+                .map(|value| summarize(Some(value)))
+                .unwrap_or_else(|| serde_json::to_string(item).unwrap_or_default()),
+            output: {
+                let kind = summarize(item.get("kind"));
+                if kind.trim().is_empty() {
+                    "completed".into()
+                } else {
+                    kind
+                }
+            },
+            diff: None,
+        }),
+        _ => Vec::new(),
+    }
+}
+
+struct HistoryTool<'a> {
+    item: &'a serde_json::Map<String, Value>,
+    item_id: &'a str,
+    turn_id: &'a str,
+    subagent_id: &'a str,
+    tool: String,
+    input: String,
+    output: String,
+    diff: Option<crate::protocol::FileDiff>,
+}
+
+fn history_tool_events(input: HistoryTool<'_>) -> Vec<Value> {
+    let summary = input.input;
+    let mut start = serde_json::Map::new();
+    start.insert("kind".into(), json!("tool.start"));
+    start.insert("msgId".into(), json!(input.turn_id));
+    start.insert("callId".into(), json!(input.item_id));
+    start.insert("tool".into(), json!(input.tool));
+    start.insert(
+        "summary".into(),
+        json!(if summary.is_empty() {
+            input.tool.clone()
+        } else {
+            summary
+        }),
+    );
+    start.insert("agentId".into(), json!(input.subagent_id));
+    if let Some(diff) = input.diff.clone() {
+        start.insert(
+            "diff".into(),
+            serde_json::to_value(diff).unwrap_or_else(|_| json!({})),
+        );
+    }
+    let mut events = vec![Value::Object(start)];
+    let status = input
+        .item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    if status == "inProgress" || status == "running" {
+        return events;
+    }
+    let failed = matches!(status, "failed" | "declined" | "error");
+    let mut end = serde_json::Map::new();
+    end.insert("kind".into(), json!("tool.end"));
+    end.insert("callId".into(), json!(input.item_id));
+    end.insert(
+        "state".into(),
+        json!(if failed { "failed" } else { "success" }),
+    );
+    let output = input.output;
+    end.insert(
+        "summary".into(),
+        json!(if output.is_empty() {
+            status.into()
+        } else {
+            output
+        }),
+    );
+    end.insert("agentId".into(), json!(input.subagent_id));
+    if let Some(diff) = input.diff {
+        end.insert(
+            "diff".into(),
+            serde_json::to_value(diff).unwrap_or_else(|_| json!({})),
+        );
+    }
+    events.push(Value::Object(end));
+    events
+}
+
+fn history_user_content(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|input| {
+                    let typ = input.get("type").and_then(Value::as_str)?;
+                    match typ {
+                        "text" => input.get("text").and_then(Value::as_str).map(str::to_owned),
+                        "skill" => input
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(|name| format!("${name}")),
+                        "mention" => input
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(|name| format!("@{name}")),
+                        "image" | "localImage" => input
+                            .get("url")
+                            .or_else(|| input.get("path"))
+                            .and_then(Value::as_str)
+                            .map(|path| format!("[图片] {path}")),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+impl CodexTurn {
+    pub(super) fn take_events(&mut self) -> Option<mpsc::Receiver<AdapterEvent>> {
+        self.events.take()
+    }
+
+    pub(super) async fn steer(&self, text: &str) -> Result<()> {
+        let Some(turn_id) = self.current_turn.lock().await.clone() else {
+            return Err(Error::Conflict);
+        };
+        self.send_request(
+            "turn/steer",
+            json!({
+                "threadId": self.thread_id,
+                "expectedTurnId": turn_id,
+                "input": [{ "type": "text", "text": text, "text_elements": [] }],
+            }),
+        )
+        .await
+    }
+
+    pub(super) async fn send_to_subagent(&self, subagent_id: &str, text: &str) -> Result<()> {
+        let input = json!([{ "type": "text", "text": text, "text_elements": [] }]);
+        if let Some(turn_id) = self.current_turns.lock().await.get(subagent_id).cloned() {
+            let steer = self
+                .send_request_value(
+                    "turn/steer",
+                    json!({
+                        "threadId": subagent_id,
+                        "expectedTurnId": turn_id,
+                        "input": input.clone(),
+                    }),
+                )
+                .await;
+            if steer.is_ok() {
+                return Ok(());
+            }
+            self.current_turns.lock().await.remove(subagent_id);
+        }
+        let mut params = serde_json::Map::new();
+        params.insert("threadId".into(), json!(subagent_id));
+        params.insert("input".into(), input);
+        params.insert("approvalPolicy".into(), self.approval_policy.clone());
+        params.insert("sandboxPolicy".into(), self.sandbox_policy.clone());
+        if let Some(model) = self.model.as_ref() {
+            params.insert("model".into(), json!(model));
+            params.insert(
+                "collaborationMode".into(),
+                json!({
+                    "mode": if self.mode == PermissionMode::Plan { "plan" } else { "default" },
+                    "settings": {
+                        "model": model,
+                        "reasoning_effort": self.effort,
+                        "developer_instructions": null,
+                    }
+                }),
+            );
+        }
+        if let Some(effort) = self.effort.as_ref() {
+            params.insert("effort".into(), json!(effort));
+        }
+        self.send_turn_start_request(
+            "turn/start",
+            Value::Object(params),
+            Some(subagent_id.to_owned()),
+        )
+        .await
+    }
+
+    pub(super) async fn read_subagent_history(
+        &self,
+        subagent_id: &str,
+    ) -> Result<Option<Vec<Value>>> {
+        let raw = self
+            .send_request_value(
+                "thread/read",
+                json!({ "threadId": subagent_id, "includeTurns": true }),
+            )
+            .await?;
+        let Some(thread) = raw.get("thread").and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        if thread.get("id").and_then(Value::as_str) != Some(subagent_id)
+            || thread.get("parentThreadId").and_then(Value::as_str) != Some(self.thread_id.as_str())
+        {
+            return Err(Error::Invalid("Codex 返回的线程不属于当前父会话".into()));
+        }
+        Ok(Some(history_events(thread, subagent_id)))
+    }
+
+    pub(super) async fn compact(&self) -> Result<()> {
+        self.send_request(
+            "thread/compact/start",
+            json!({ "threadId": self.thread_id }),
+        )
+        .await
+    }
+
+    pub(super) async fn apply_selection(&self, model: &str, effort: Option<&str>) -> Result<()> {
+        self.send_request(
+            "thread/settings/update",
+            json!({
+                "threadId": self.thread_id,
+                "collaborationMode": {
+                    "mode": "default",
+                    "settings": {
+                        "model": model,
+                        "reasoning_effort": effort,
+                        "developer_instructions": null,
+                    }
+                }
+            }),
+        )
+        .await
+    }
+
+    async fn send_request(&self, method: &str, params: Value) -> Result<()> {
+        if method != "turn/start" {
+            self.send_request_value(method, params).await.map(|_| ())
+        } else {
+            self.send_turn_start_request(method, params, None).await
+        }
+    }
+
+    async fn send_turn_start_request(
+        &self,
+        method: &str,
+        params: Value,
+        subagent: Option<String>,
+    ) -> Result<()> {
+        let id = uuid::Uuid::new_v4().as_u128().to_string();
+        self.responses.lock().await.insert(
+            id.clone(),
+            PendingResponse::FinishOnError {
+                method: method.to_owned(),
+                subagent,
+                retry_params: alternate_turn_start_params(&params),
+            },
+        );
+        let (ack, ack_rx) = oneshot::channel();
+        let send_result = self
+            .stdin
+            .send((
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": params,
+                }),
+                Some(ack),
+            ))
+            .await;
+        if send_result.is_err() {
+            self.responses.lock().await.remove(&id);
+            return Err(Error::Invalid(
+                diagnostic_message(
+                    &self.diagnostics,
+                    "codex turn/start 失败: app-server 管道不可写",
+                )
+                .await,
+            ));
+        }
+        match tokio::time::timeout(CONTROL_TIMEOUT, ack_rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                self.responses.lock().await.remove(&id);
+                Err(Error::Invalid(
+                    diagnostic_message(&self.diagnostics, "codex turn/start 失败: 写入未确认")
+                        .await,
+                ))
+            }
+            Err(_) => {
+                self.responses.lock().await.remove(&id);
+                Err(Error::Invalid(
+                    diagnostic_message(&self.diagnostics, "codex turn/start 发送超时").await,
+                ))
+            }
+        }
+    }
+
+    async fn send_request_value(&self, method: &str, params: Value) -> Result<Value> {
+        let id = uuid::Uuid::new_v4().as_u128().to_string();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.responses.lock().await.insert(
+            id.clone(),
+            PendingResponse::Reply {
+                method: method.to_owned(),
+                tx: reply_tx,
+            },
+        );
+        let (ack, ack_rx) = oneshot::channel();
+        let send_result = self
+            .stdin
+            .send((
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": params,
+                }),
+                Some(ack),
+            ))
+            .await;
+        if send_result.is_err() {
+            self.responses.lock().await.remove(&id);
+            return Err(Error::Invalid(
+                diagnostic_message(
+                    &self.diagnostics,
+                    &format!("codex {method} 失败: app-server 管道不可写"),
+                )
+                .await,
+            ));
+        }
+        match tokio::time::timeout(CONTROL_TIMEOUT, ack_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.responses.lock().await.remove(&id);
+                return Err(Error::Invalid(
+                    diagnostic_message(
+                        &self.diagnostics,
+                        &format!("codex {method} 失败: 写入未确认"),
+                    )
+                    .await,
+                ));
+            }
+            Err(_) => {
+                self.responses.lock().await.remove(&id);
+                return Err(Error::Invalid(
+                    diagnostic_message(&self.diagnostics, &format!("codex {method} 发送超时"))
+                        .await,
+                ));
+            }
+        }
+        let result = match tokio::time::timeout(CONTROL_TIMEOUT, reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                return Err(Error::Invalid(
+                    diagnostic_message(
+                        &self.diagnostics,
+                        &format!("codex {method} 失败: app-server 响应通道关闭"),
+                    )
+                    .await,
+                ));
+            }
+            Err(_) => {
+                self.responses.lock().await.remove(&id);
+                return Err(Error::Invalid(
+                    diagnostic_message(&self.diagnostics, &format!("codex {method} 响应超时"))
+                        .await,
+                ));
+            }
+        };
+        result.map_err(Error::Invalid)
+    }
+
+    pub(super) fn kill(&self) {
+        kill_process_group(self.child_pid);
+    }
+}

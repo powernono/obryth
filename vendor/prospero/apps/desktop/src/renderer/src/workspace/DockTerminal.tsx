@@ -1,0 +1,58 @@
+import { readTerminalMousePreference, TerminalMouseToggle, TERMINAL_MOUSE_MODE_EVENT } from "./TerminalMouseToggle";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { RefreshCw } from "lucide-react";
+import type { DesktopSnapshot, SessionInfo } from "../../../shared/types";
+import { Button } from "../components/ui/button";
+import { useLocale } from "../locale";
+import { reportError } from "../state";
+import { shellIsLive, workspaceShell } from "./shell-session";
+
+const TerminalPane = lazy(() => import("../TerminalPane").then((module) => ({ default: module.TerminalPane })));
+
+export function DockTerminal({ session, root = session.cwd, snapshot, active = true }: { session: SessionInfo; root?: string; snapshot: DesktopSnapshot; active?: boolean }) {
+  const { t } = useLocale();
+  const [shell, setShell] = useState<SessionInfo>();
+  const [localSelection, setLocalSelection] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string>();
+  const [attempt, setAttempt] = useState(0);
+  const sessions = useRef(snapshot.daemon.sessions);
+  sessions.current = snapshot.daemon.sessions;
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError(undefined);
+    setShell(undefined);
+    void workspaceShell(window.prospero, root, sessions.current).then((created) => { if (active) setShell(created); }).catch((reason) => { if (active) setError(reportError(reason)); }).finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [root, attempt]);
+  const current = snapshot.daemon.sessions.find((item) => item.id === shell?.id) ?? shell;
+  const shellSessionId = current?.id;
+  useEffect(() => {
+    setLocalSelection(readTerminalMousePreference(undefined, shellSessionId));
+  }, [shellSessionId]);
+  useEffect(() => {
+    const sync = (event: Event): void => {
+      if (event.type === "storage") {
+        const key = (event as StorageEvent).key;
+        if (key !== "prospero.terminal.mouse-mode" && key !== `prospero.terminal.mouse-mode:${shellSessionId}`) return;
+        setLocalSelection(readTerminalMousePreference(undefined, shellSessionId));
+        return;
+      }
+      const custom = (event as CustomEvent<{ sessionId?: string; localSelection?: boolean }>).detail;
+      if (custom?.sessionId === shellSessionId && typeof custom.localSelection === "boolean") setLocalSelection(custom.localSelection);
+    };
+    window.addEventListener(TERMINAL_MOUSE_MODE_EVENT, sync);
+    window.addEventListener("storage", sync);
+    return () => { window.removeEventListener(TERMINAL_MOUSE_MODE_EVENT, sync); window.removeEventListener("storage", sync); };
+  }, [shellSessionId]);
+  const forgetShell = useCallback((): void => {
+    setShell(undefined);
+    setError(t("终端会话已不存在", "Terminal session no longer exists"));
+  }, [t]);
+  return <div className="dock-terminal">
+    <div className="dock-terminal-toolbar"><span title={root}>{root}</span>{current && <TerminalMouseToggle sessionId={current.id} localSelection={localSelection} onChange={setLocalSelection} />}{(error || current && !shellIsLive(current)) && <Button variant="ghost" size="icon-xs" disabled={loading} aria-label={t("重建终端", "Recreate terminal")} onClick={() => setAttempt((value) => value + 1)}><RefreshCw /></Button>}</div>
+    {error && <div className="workspace-action-error" role="alert">{error}</div>}
+    {loading ? <div className="dock-empty" role="status">{t("正在连接工作区终端…", "Connecting workspace terminal…")}</div> : current ? <Suspense fallback={<div className="dock-empty" role="status">{t("正在加载终端…", "Loading terminal…")}</div>}><TerminalPane localSelection={localSelection} key={current.id} session={current} fontFamily={snapshot.settings.terminalFontFamily} fontSize={snapshot.settings.terminalFontSize} active={active} onMissingSession={forgetShell} /></Suspense> : null}
+  </div>;
+}

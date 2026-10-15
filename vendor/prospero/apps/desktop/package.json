@@ -1,0 +1,191 @@
+{
+  "name": "@prospero/desktop",
+  "version": "0.0.14",
+  "private": true,
+  "description": "Prospero local agent workspace for Windows",
+  "author": "Prospero contributors",
+  "type": "module",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "prebuild": "npm run build -w @prospero/protocol",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "pretypecheck": "npm run build -w @prospero/protocol",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --dir test",
+    "check:chrome": "npm run build && electron scripts/check-window-chrome.cjs",
+    "check:chat": "npm run build && electron scripts/check-chat.cjs",
+    "check:terminal": "npm run build && electron scripts/check-terminal.cjs",
+    "check:terminal:performance": "electron scripts/check-terminal-performance.cjs",
+    "check:terminal:stream": "npm run build && electron scripts/check-terminal-stream.cjs",
+    "check:project-tools": "npm run build && electron scripts/check-project-tools.cjs",
+    "check:packaged-rust": "node scripts/smoke-packaged-runtime.cjs",
+    "pack": "npm run build && electron-builder --dir",
+    "prepare:runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-runtime.ps1",
+    "dist": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1",
+    "prepare:runtime:mac": "node scripts/prepare-runtime.mjs",
+    "install:rust-daemon:mac": "sh scripts/install-rust-daemon-launchagent.sh install",
+    "uninstall:rust-daemon:mac": "sh scripts/install-rust-daemon-launchagent.sh uninstall",
+    "dist:mac": "npm run prepare:runtime:mac && npm run build && electron-builder --mac",
+    "preview:ux": "npm run build && electron scripts/preview-ux.cjs"
+  },
+  "dependencies": {
+    "@base-ui/react": "^1.7.0",
+    "@shadcn/react": "^0.3.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "katex": "^0.18.7",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "rehype-katex": "^7.0.1",
+    "remark-gemoji": "^8.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
+    "remark-parse": "^11.0.0",
+    "shadcn": "^4.19.0",
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^4.3.3",
+    "tw-animate-css": "^1.4.0",
+    "unified": "^11.0.5",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.5",
+    "@types/ws": "^8.5.13",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-search": "^0.16.0",
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/addon-webgl": "^0.19.0",
+    "@xterm/xterm": "^6.0.0",
+    "electron": "43.4.1",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^5.0.0",
+    "lucide-react": "^0.542.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "vite": "^7.0.0",
+    "vitest": "^3.2.7"
+  },
+  "optionalDependencies": {
+    "@esbuild/win32-x64": "^0.25.12",
+    "@rollup/rollup-win32-x64-msvc": "^4.62.4",
+    "@tailwindcss/oxide-win32-x64-msvc": "^4.3.3",
+    "lightningcss-win32-x64-msvc": "^1.33.0"
+  },
+  "build": {
+    "appId": "ai.prospero.desktop",
+    "productName": "Prospero",
+    "asar": true,
+    "beforePack": "scripts/check-runtime-architecture.cjs",
+    "npmRebuild": false,
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
+    ],
+    "asarUnpack": [
+      "**/*.node"
+    ],
+    "directories": {
+      "output": "../../dist/desktop"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": ".runtime",
+        "to": "runtime",
+        "filter": [
+          "**/*",
+          "!node_modules{,/**/*}"
+        ]
+      },
+      {
+        "from": ".runtime/node_modules",
+        "to": "runtime/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../shell/Resources/AppIcon-1024.png",
+        "to": "assets/AppIcon.png"
+      }
+    ],
+    "win": {
+      "icon": "../shell/Resources/AppIcon-1024.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "artifactName": "Prospero-${version}-windows-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Prospero",
+      "installerLanguages": [
+        "zh_CN",
+        "en_US"
+      ],
+      "language": "2052",
+      "installerSidebar": "assets/installer-sidebar.bmp",
+      "uninstallerSidebar": "assets/installer-sidebar.bmp"
+    },
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "../shell/Resources/AppIcon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Prospero-${version}-mac-${arch}.${ext}",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "NSLocalNetworkUsageDescription": "Prospero 在本地网络上广播与接受来自你手机的直连,用于远程控制 code agent 会话。",
+        "NSBonjourServices": [
+          "_prospero._tcp"
+        ],
+        "LSMinimumSystemVersion": "14.0"
+      }
+    }
+  }
+}

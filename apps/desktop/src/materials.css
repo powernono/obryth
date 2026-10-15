@@ -1,0 +1,270 @@
+/* Shared translucent surfaces keep every layer of the workspace open to the backdrop. */
+:root[data-material="glass"] {
+  --content-glass: color-mix(in srgb, var(--bg) 72%, transparent);
+  --panel-glass: color-mix(in srgb, var(--bg) 48%, transparent);
+  --glass-shadow: inset 0 1px 0 var(--glass-highlight), 0 8px 30px #00000008;
+}
+:root[data-material="glass"][data-theme="dark"] {
+  --content-glass: color-mix(in srgb, var(--bg) 78%, transparent);
+  --panel-glass: color-mix(in srgb, var(--bg) 52%, transparent);
+}
+:root[data-material="glass"] .workbench {
+  background:
+    radial-gradient(
+      ellipse at 85% 5%,
+      color-mix(in srgb, var(--accent) 16%, transparent),
+      transparent 58%
+    ),
+    radial-gradient(
+      ellipse at 30% 90%,
+      color-mix(in srgb, var(--accent) 10%, transparent),
+      transparent 60%
+    );
+  border: 1px solid var(--glass-edge);
+  border-right: 0;
+  border-bottom: 0;
+  box-shadow: var(--glass-shadow);
+}
+:root[data-material="glass"] .obryth-dock {
+  --dv-background-color: transparent;
+  --dv-group-view-background-color: transparent;
+  --dv-tabs-and-actions-container-background-color: var(--panel-glass);
+  --dv-activegroup-visiblepanel-tab-background-color: var(--content-glass);
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--panel-glass);
+  --dv-activegroup-hiddenpanel-tab-background-color: transparent;
+  --dv-inactivegroup-hiddenpanel-tab-background-color: transparent;
+}
+:root[data-material="glass"]
+  :is(
+    .note-index,
+    .note-inspector,
+    .browser-page-list,
+    .browser-toolbar,
+    .dv-tabs-and-actions-container
+  ) {
+  background: var(--panel-glass);
+  border-color: var(--glass-edge);
+  -webkit-backdrop-filter: blur(22px) saturate(1.25);
+  backdrop-filter: blur(22px) saturate(1.25);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+:root[data-material="glass"]
+  :is(
+    .note-pane,
+    .agent-pane,
+    .search-pane,
+    .management-page,
+    .browser-start,
+    .home-pane
+  ) {
+  background: var(--content-glass);
+}
+:root[data-material="glass"] .home-pane {
+  --muted: color-mix(in srgb, var(--ink) 72%, var(--bg));
+  --line: var(--glass-edge);
+  --soft: color-mix(in srgb, var(--bg) 36%, transparent);
+  --home-glass-fill: color-mix(in srgb, var(--bg) 52%, transparent);
+  --home-control-fill: color-mix(in srgb, var(--bg) 32%, transparent);
+  --home-accent-fill: color-mix(in srgb, var(--accent-soft) 70%, transparent);
+  --home-glass-sheen: linear-gradient(
+    135deg,
+    #ffffff38,
+    #ffffff08 42%,
+    transparent 65%,
+    color-mix(in srgb, var(--accent) 5%, transparent)
+  );
+  --home-glass-shadow:
+    inset 0 1px 0 var(--glass-highlight), inset 0 -1px 0 #ffffff12,
+    0 8px 24px #00000005;
+  background: transparent;
+}
+:root[data-material="glass"][data-theme="dark"] .home-pane {
+  --home-glass-fill: color-mix(in srgb, var(--bg) 60%, transparent);
+  --home-glass-sheen: linear-gradient(
+    135deg,
+    #ffffff09,
+    transparent 48%,
+    color-mix(in srgb, var(--accent) 3%, transparent)
+  );
+  --home-glass-shadow:
+    inset 0 1px 0 var(--glass-highlight), inset 0 -1px 0 #ffffff04,
+    0 8px 24px #00000012;
+}
+:root[data-material="glass"]
+  :is(
+    .home-capture,
+    .activity-card,
+    .home-pinned,
+    .home-recent,
+    .activity-empty,
+    .home-actions > button
+  ) {
+  background: var(--home-glass-sheen), var(--home-glass-fill);
+  border-color: var(--glass-edge);
+  -webkit-backdrop-filter: blur(24px) saturate(1.3);
+  backdrop-filter: blur(24px) saturate(1.3);
+  box-shadow: var(--home-glass-shadow);
+}
+:root[data-material="glass"] .home-activity {
+  --heatmap-glass-fill: color-mix(in srgb, var(--bg) 44%, transparent);
+  --activity-surface: var(--home-control-fill);
+  --activity-muted: var(--muted);
+  --activity-border: var(--glass-edge);
+  background:
+    radial-gradient(
+      ellipse at 100% 0%,
+      color-mix(in srgb, var(--accent) 10%, transparent),
+      transparent 65%
+    ),
+    var(--home-glass-sheen), var(--heatmap-glass-fill);
+  border-color: var(--glass-edge);
+  -webkit-backdrop-filter: blur(28px) saturate(1.4);
+  backdrop-filter: blur(28px) saturate(1.4);
+  box-shadow: var(--home-glass-shadow);
+}
+:root[data-material="glass"][data-theme="dark"] .home-activity {
+  --heatmap-glass-fill: color-mix(in srgb, var(--bg) 54%, transparent);
+}
+:root[data-material="glass"][data-native-material="true"] .home-activity {
+  --heatmap-glass-fill: color-mix(in srgb, var(--bg) 30%, transparent);
+}
+:root[data-material="glass"] .home-capture:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--glass-edge));
+}
+:root[data-material="glass"] .home-aside-content {
+  gap: 16px;
+}
+:root[data-material="glass"] :is(.home-pinned, .home-recent) {
+  padding: 14px 12px 7px;
+  border: 1px solid var(--glass-edge);
+  border-radius: 12px;
+}
+:root[data-material="glass"] .home-actions {
+  gap: 8px;
+}
+:root[data-material="glass"] .home-actions > button {
+  padding: 11px 8px;
+  border: 1px solid var(--glass-edge);
+  border-radius: 10px;
+}
+:root[data-material="glass"] .home-pinned > button {
+  padding: 8px 6px;
+  background: transparent;
+  border-color: transparent;
+}
+:root[data-material="glass"] .home-note {
+  padding: 9px 6px;
+  border-bottom-color: transparent;
+  border-radius: 7px;
+}
+:root[data-material="glass"] :is(.home-pinned > button, .home-note):hover {
+  background: var(--home-accent-fill);
+}
+:root[data-material="glass"] .home-actions > button:hover {
+  background-color: var(--home-accent-fill);
+}
+:root[data-material="glass"]
+  :is(
+    .home-kind-filter,
+    .home-aside-toggle,
+    .activity-load-more,
+    .activity-refresh-status,
+    .home-date-filter
+  ) {
+  background: var(--home-glass-sheen), var(--home-control-fill);
+  border: 1px solid var(--glass-edge);
+  border-radius: 9px;
+  -webkit-backdrop-filter: blur(16px) saturate(1.2);
+  backdrop-filter: blur(16px) saturate(1.2);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+:root[data-material="glass"] .home-kind-filter {
+  padding: 3px;
+  gap: 2px;
+}
+:root[data-material="glass"] .home-aside-toggle {
+  padding: 10px 12px;
+}
+:root[data-material="glass"] :is(.activity-heading select, .home-error button) {
+  background: var(--home-control-fill);
+  border-color: var(--glass-edge);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+:root[data-material="glass"]
+  :is(.home-kind-filter button[aria-pressed="true"], .activity-tags > span) {
+  background: var(--home-accent-fill);
+}
+:root[data-material="glass"] .activity-empty {
+  border-style: solid;
+}
+:root[data-material="glass"]
+  :is(.home-kind-filter button, .activity-load-more, .home-aside-toggle):hover {
+  background-color: var(--home-accent-fill);
+}
+:root[data-material="glass"] .heatmap-tooltip {
+  color: var(--ink);
+  background:
+    var(--home-glass-sheen), color-mix(in srgb, var(--bg) 88%, transparent);
+  border-color: var(--glass-edge);
+  -webkit-backdrop-filter: blur(24px) saturate(1.3);
+  backdrop-filter: blur(24px) saturate(1.3);
+  box-shadow: var(--home-glass-shadow);
+}
+:root[data-material="glass"] .heatmap-tooltip time {
+  color: var(--muted);
+}
+:root[data-material="glass"]
+  :is(.note-controls, .format-toolbar, .pane-toolbar) {
+  background: var(--panel-glass);
+  border-color: var(--glass-edge);
+}
+:root[data-material="glass"]
+  :is(.editor-surface, .source-editor, .cm-editor, .cm-gutters) {
+  background: transparent;
+}
+:root[data-material="glass"] .preview-banner {
+  background: var(--panel-glass);
+}
+:root[data-native-material="true"] {
+  --panel-glass: color-mix(in srgb, var(--bg) 38%, transparent);
+}
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  :root[data-material="glass"] {
+    --content-glass: var(--bg);
+    --panel-glass: var(--bg);
+  }
+  :root[data-material="glass"] .workbench,
+  :root[data-material="glass"] .home-pane {
+    background: var(--bg);
+  }
+  :root[data-material="glass"] .home-pane,
+  :root[data-material="glass"][data-theme="dark"] .home-pane {
+    --home-glass-fill: var(--bg);
+    --home-control-fill: var(--bg);
+    --home-glass-sheen: none;
+    --home-accent-fill: var(--accent-soft);
+    --soft: var(--bg);
+  }
+  :root[data-material="glass"] .home-pane *,
+  :root[data-material="glass"] .home-pane button {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  :root[data-material="glass"] .heatmap-tooltip {
+    background: var(--bg);
+  }
+  :root[data-material="glass"] .home-activity {
+    background: var(--bg);
+  }
+  :root[data-material="glass"]
+    :is(
+      .note-index,
+      .note-inspector,
+      .browser-page-list,
+      .browser-toolbar,
+      .dv-tabs-and-actions-container
+    ) {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}

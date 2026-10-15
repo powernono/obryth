@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "resources": [
+      "binaries/prosperod-rs.exe",
+      "../../../vendor/prospero/LICENSE"
+    ]
+  }
+}

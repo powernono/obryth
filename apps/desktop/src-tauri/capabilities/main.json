@@ -1,0 +1,14 @@
+{
+  "identifier": "main",
+  "description": "Trusted Obryth application UI only; external browser views have no capabilities",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-theme",
+    "core:window:allow-set-effects",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "opener:allow-open-url"
+  ]
+}

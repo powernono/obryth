@@ -1,0 +1,21 @@
+[workspace]
+members = [
+  "apps/daemon-rs",
+  "apps/desktop-rs",
+  "crates/prospero-client",
+  "crates/prospero-protocol",
+  "crates/prospero-terminal-view",
+]
+resolver = "3"
+exclude = ["vendor/avt"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+overflow-checks = true

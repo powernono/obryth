@@ -1,0 +1,24 @@
+pub mod accounts;
+pub mod agent;
+pub mod auth;
+pub mod control_cli;
+#[doc(hidden)]
+pub mod cross_model_tool;
+pub mod database;
+pub mod error;
+pub mod orchestration;
+pub mod pairing;
+pub mod plugins;
+pub mod project;
+pub mod protocol;
+mod queries;
+mod reader;
+pub mod relay;
+pub mod remote_crypto;
+pub mod schedules;
+pub mod server;
+pub mod skills;
+pub mod terminal;
+mod timeline;
+pub mod transport;
+pub mod worker;

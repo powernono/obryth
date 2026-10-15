@@ -1,0 +1,648 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  CAPABILITY_AGENT_ACCOUNTS,
+  CAPABILITY_AGENT_API_PROFILES,
+  CAPABILITY_AGENT_API_PROTOCOLS,
+  CAPABILITY_FS_PUT_ACK,
+  CAPABILITY_MODEL_SOURCES,
+  CAPABILITY_SESSION_CREATE_RESULT,
+  CAPABILITY_WORKSPACE_SUMMARY,
+  generateKeyPairB64,
+  type SessionInfo,
+} from "@prospero/protocol";
+import { dropConnection, getConnection, HostConnection, wireAppStateReconnect } from "../src/lib/connection";
+import type { StoredHost } from "../src/lib/hosts";
+import { flushSessionUpdates, useApp } from "../src/lib/store";
+import { randomUUID } from "expo-crypto";
+
+const appState = vi.hoisted(() => ({ callback: null as ((state: string) => void) | null }));
+
+vi.mock("react-native", () => ({
+  AppState: {
+    addEventListener: vi.fn((_event: string, callback: (state: string) => void) => {
+      appState.callback = callback;
+      return { remove: vi.fn() };
+    }),
+  },
+  Platform: { OS: "ios" },
+}));
+vi.mock("expo-crypto", () => ({ randomUUID: vi.fn(() => "ping-0123456789") }));
+vi.mock("@react-native-async-storage/async-storage", () => ({
+  default: { getItem: vi.fn(), setItem: vi.fn(), removeItem: vi.fn() },
+}));
+vi.mock("expo-secure-store", () => ({
+  AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY: 1,
+  isAvailableAsync: vi.fn(),
+  getItemAsync: vi.fn(),
+  setItemAsync: vi.fn(),
+  deleteItemAsync: vi.fn(),
+}));
+
+class FakeWebSocket {
+  static sockets: FakeWebSocket[] = [];
+  static throwFor: ((url: string) => boolean) | null = null;
+  readonly sent: string[] = [];
+  readyState = 0;
+  onopen: (() => void) | null = null;
+  onmessage: ((event: { data: unknown }) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onclose: ((event: { code?: number; reason?: string }) => void) | null = null;
+
+  constructor(readonly url: string) {
+    if (FakeWebSocket.throwFor?.(url)) throw new Error("synchronous open failure");
+    FakeWebSocket.sockets.push(this);
+  }
+
+  send(data: string): void { this.sent.push(data); }
+  close(): void { this.readyState = 3; }
+}
+
+const makeHost = (connectionMode: StoredHost["connectionMode"]): StoredHost => ({
+  id: `host-${connectionMode}`,
+  name: "Mac",
+  addrs: ["192.168.1.8", "10.0.0.8"],
+  port: 7423,
+  token: "0123456789abcdef",
+  daemonPub: generateKeyPairB64().publicKey,
+  pairedAt: 1,
+  connectionMode,
+  relay: { url: "wss://relay.example.com/v1", routeId: "route_0123456789", deviceId: "device_0123456789" },
+  relayToken: "relay_token_0123456789",
+});
+
+afterEach(() => {
+  FakeWebSocket.sockets = [];
+  FakeWebSocket.throwFor = null;
+  appState.callback = null;
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
+});
+
+function endedTerminalConnection() {
+  const host = { ...makeHost("direct"), id: "terminal-actions-mac" };
+  const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+  socket.readyState = 1;
+  const connection = new HostConnection(host, generateKeyPairB64());
+  const internals = connection as unknown as {
+    ws: FakeWebSocket; channel: { seal(message: unknown): string; open(message: string): unknown };
+    onMessage(message: string): void;
+  };
+  internals.ws = socket;
+  internals.channel = { seal: JSON.stringify, open: JSON.parse };
+  const session: SessionInfo = { id: "ended-shell", agent: "shell", kind: "pty", cwd: "/Users/test/My Project", title: "Terminal", cols: 96, rows: 32, status: "done", createdAt: 1 };
+  useApp.getState().patchRuntime(host.id, { hostInfo: { name: "Mac", platform: "macOS", daemonVersion: "test", protocolVersion: 13 } });
+  useApp.getState().setSessions(host.id, [session]);
+  return { host, socket, connection, session, internals };
+}
+
+describe("ended terminal actions", () => {
+  it("restarts a fresh shell in its original directory and size without replaying old input", async () => {
+    const { connection, socket, session } = endedTerminalConnection();
+    const task = connection.restartTerminal(session.id);
+    expect(socket.sent.map((message) => JSON.parse(message))).toEqual([{
+      type: "session.create", agent: "shell", kind: "pty", cwd: session.cwd, cols: 96, rows: 32,
+    }]);
+    expect(connection.queuedCount).toBe(0);
+    task.cancel();
+    await expect(task.completion).rejects.toMatchObject({ reason: "cancelled" });
+    connection.stop();
+  });
+
+  it.each(["done", "already-removed", "legacy-already-removed"])("deletes ended terminal metadata after %s and rejects late state resurrection", async (reply) => {
+    const { connection, socket, session, internals, host } = endedTerminalConnection();
+    const serverError = vi.fn();
+    connection.events.on("serverError", serverError);
+    try {
+      const removed = connection.deleteTerminal(session.id);
+      expect(useApp.getState().runtimes[host.id]?.sessions[session.id]).toBeDefined();
+      expect(socket.sent.map((message) => JSON.parse(message))).toEqual([{ type: "session.kill", sid: session.id }]);
+      internals.onMessage(JSON.stringify(reply === "done" ? { type: "session.state", session }
+        : reply === "legacy-already-removed"
+          ? { type: "error", code: "session_not_found", message: `no such session: ${session.id}` }
+          : { type: "error", sid: session.id, code: "session_not_found", message: "no session" }));
+      await removed;
+      internals.onMessage(JSON.stringify({ type: "session.state", session }));
+      flushSessionUpdates();
+      expect(useApp.getState().runtimes[host.id]?.sessions[session.id]).toBeUndefined();
+      expect(serverError).not.toHaveBeenCalled();
+    } finally { connection.stop(); }
+  });
+
+  it("keeps an ended record available if deletion is rejected or offline", async () => {
+    const { connection, socket, session, internals, host } = endedTerminalConnection();
+    const removed = connection.deleteTerminal(session.id);
+    internals.onMessage(JSON.stringify({ type: "error", sid: session.id, code: "forbidden", message: "denied" }));
+    await expect(removed).rejects.toThrow("denied");
+    expect(useApp.getState().runtimes[host.id]?.sessions[session.id]).toBeDefined();
+    socket.readyState = 3;
+    await expect(connection.deleteTerminal(session.id)).rejects.toThrow("主机未连接");
+    const restarted = connection.restartTerminal(session.id);
+    await expect(restarted.completion).rejects.toMatchObject({ reason: "offline" });
+    expect(connection.queuedCount).toBe(0);
+    expect(socket.sent).toHaveLength(1);
+    connection.stop();
+  });
+
+  it("does not restart or delete a live terminal or an unsupported remote host", async () => {
+    const { connection, socket, session, host } = endedTerminalConnection();
+    useApp.getState().upsertSession(host.id, { ...session, status: "running" });
+    expect(() => connection.restartTerminal(session.id)).toThrow("请先关闭终端");
+    await expect(connection.deleteTerminal(session.id)).rejects.toThrow("请先关闭终端");
+    useApp.getState().upsertSession(host.id, session);
+    useApp.getState().patchRuntime(host.id, { hostInfo: { name: "MacBook", platform: "Linux", daemonVersion: "test", protocolVersion: 13 } });
+    expect(() => connection.restartTerminal(session.id)).toThrow("只支持 macOS");
+    await expect(connection.deleteTerminal(session.id)).rejects.toThrow("只支持 macOS");
+    expect(socket.sent).toHaveLength(0);
+    connection.stop();
+  });
+});
+
+describe("HostConnection WebSocket candidates", () => {
+  it("closes a remote Mac shell with session.kill and waits for its ended state", async () => {
+    const host = { ...makeHost("direct"), id: "terminal-close-mac" };
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(host, generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket; channel: { seal(message: unknown): string; open(message: string): unknown };
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    const shell: SessionInfo = { id: "shell", agent: "shell", kind: "pty", cwd: "/Users/test", title: "Terminal", cols: 80, rows: 24, status: "running", createdAt: 1 };
+    useApp.getState().patchRuntime(host.id, { hostInfo: { name: "Mac", platform: "macOS", daemonVersion: "test", protocolVersion: 13 } });
+    useApp.getState().setSessions(host.id, [shell]);
+    try {
+      let closed = false;
+      const completion = connection.closeTerminal(shell.id);
+      void completion.then(() => { closed = true; });
+      expect(connection.closeTerminal(shell.id)).toBe(completion);
+      expect(socket.sent.map((message) => JSON.parse(message))).toEqual([{ type: "session.kill", sid: shell.id }]);
+      internals.onMessage(JSON.stringify({ type: "session.state", session: shell }));
+      await Promise.resolve();
+      expect(closed).toBe(false);
+      internals.onMessage(JSON.stringify({ type: "session.state", session: { ...shell, status: "done" } }));
+      await completion;
+      flushSessionUpdates();
+      expect(closed).toBe(true);
+      expect(useApp.getState().runtimes[host.id]?.sessions[shell.id]?.status).toBe("done");
+      await connection.closeTerminal(shell.id);
+      expect(socket.sent).toHaveLength(1);
+      expect(connection.queuedCount).toBe(0);
+    } finally { flushSessionUpdates(); connection.stop(); }
+  });
+
+  it("checks the remote platform and never queues a terminal close across a disconnect", async () => {
+    const host = { ...makeHost("direct"), id: "terminal-close-disconnected" };
+    const connection = new HostConnection(host, generateKeyPairB64());
+    const shell: SessionInfo = { id: "shell", agent: "shell", kind: "pty", cwd: "/Users/test", title: "Terminal", cols: 80, rows: 24, status: "running", createdAt: 1 };
+    const hostInfo = { name: "MacBook", platform: "Windows", daemonVersion: "test", protocolVersion: 13 };
+    useApp.getState().patchRuntime(host.id, { hostInfo });
+    useApp.getState().setSessions(host.id, [shell]);
+    await expect(connection.closeTerminal(shell.id)).rejects.toThrow("只支持 macOS");
+    useApp.getState().patchRuntime(host.id, { hostInfo: { ...hostInfo, platform: "macOS" } });
+    await expect(connection.closeTerminal(shell.id)).rejects.toThrow("主机未连接");
+    expect(connection.queuedCount).toBe(0);
+    const send = vi.spyOn(connection, "send").mockReturnValue({ accepted: true, disposition: "sent" });
+    const completion = connection.closeTerminal(shell.id);
+    expect(send).toHaveBeenCalledWith({ type: "session.kill", sid: shell.id }, false);
+    connection.stop();
+    await expect(completion).rejects.toThrow("未能确认");
+    expect(connection.queuedCount).toBe(0);
+  });
+
+  it("correlates concurrent workspace summaries independently of git status and response order", async () => {
+    vi.mocked(randomUUID).mockReturnValueOnce("11111111-1111-4111-8111-111111111111").mockReturnValueOnce("22222222-2222-4222-8222-222222222222");
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket; channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>; onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    expect(connection.supportsWorkspaceSummary).toBe(false);
+    internals.advertisedCapabilities = new Set([CAPABILITY_WORKSPACE_SUMMARY]);
+    expect(connection.supportsWorkspaceSummary).toBe(true);
+    try {
+      const first = connection.workspaceSummary("session");
+      const second = connection.workspaceSummary("session");
+      const status = connection.gitStatus("session");
+      const requests = socket.sent.map((message) => JSON.parse(message));
+      const reply = { type: "workspace.summary.result", sid: "session", branch: "main", sizeBytes: 23, sizeComplete: true, checkedAt: 1 };
+      internals.onMessage(JSON.stringify({ ...reply, requestId: requests[1].requestId }));
+      await expect(second).resolves.toMatchObject({ sizeBytes: 23 });
+      internals.onMessage(JSON.stringify({ type: "git.status.result", sid: "session", branch: "main", files: [], ahead: 0, behind: 0, staged: false }));
+      await expect(status).resolves.toMatchObject({ branch: "main" });
+      internals.onMessage(JSON.stringify({ ...reply, requestId: requests[0].requestId, sizeBytes: 12 }));
+      await expect(first).resolves.toMatchObject({ sizeBytes: 12 });
+    } finally { connection.stop(); }
+  });
+
+  it.each([
+    ["direct", 2, ["ws://192.168.1.8:7423/ws", "ws://10.0.0.8:7423/ws"]],
+    ["relay", 1, ["wss://relay.example.com/v1/client"]],
+    ["auto", 3, ["ws://192.168.1.8:7423/ws", "ws://10.0.0.8:7423/ws", "wss://relay.example.com/v1/client"]],
+  ] as const)("starts %s candidates concurrently", async (mode, count, urls) => {
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const connection = new HostConnection(makeHost(mode), generateKeyPairB64());
+    const raced = (connection as unknown as { race(): Promise<unknown> }).race();
+    expect(FakeWebSocket.sockets.map((socket) => socket.url)).toEqual(urls);
+    expect(FakeWebSocket.sockets).toHaveLength(count);
+    connection.stop();
+    await expect(raced).rejects.toThrow();
+  });
+
+  it("turns a synchronous relay WebSocket failure into a candidate failure", async () => {
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    FakeWebSocket.throwFor = (url) => url.startsWith("wss://");
+    const connection = new HostConnection(makeHost("relay"), generateKeyPairB64());
+    await expect((connection as unknown as { race(): Promise<unknown> }).race()).rejects.toThrow();
+    expect(connection.diagnosis?.summary).toContain("TLS");
+  });
+
+  it("classifies sockets that never open as unreachable instead of claiming the daemon did not respond", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const raced = (connection as unknown as { race(): Promise<unknown> }).race();
+    const rejected = expect(raced).rejects.toThrow();
+
+    await vi.advanceTimersByTimeAsync(6_000);
+    await rejected;
+
+    expect(connection.diagnosis?.summary).toContain("无法连接");
+    expect(connection.diagnosis?.hint).toContain("本地网络");
+    expect(connection.diagnosis?.hint).not.toContain("prosperod 没有响应");
+  });
+
+  it("keeps an opened socket with no E2E handshake response classified as a daemon timeout", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const raced = (connection as unknown as { race(): Promise<unknown> }).race();
+    const rejected = expect(raced).rejects.toThrow();
+    for (const socket of FakeWebSocket.sockets) {
+      socket.readyState = 1;
+      socket.onopen?.();
+    }
+
+    await vi.advanceTimersByTimeAsync(6_000);
+    await rejected;
+
+    expect(connection.diagnosis?.summary).toContain("无应答");
+    expect(connection.diagnosis?.hint).toContain("prosperod 没有响应");
+  });
+
+  it("restarts a stopped candidate on foreground / network recovery", () => {
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const host = makeHost("direct");
+    const connection = getConnection(host, generateKeyPairB64());
+    wireAppStateReconnect();
+    connection.stop();
+    appState.callback?.("active");
+    expect(FakeWebSocket.sockets.map((socket) => socket.url)).toEqual([
+      "ws://192.168.1.8:7423/ws",
+      "ws://10.0.0.8:7423/ws",
+    ]);
+    dropConnection(host.id);
+    // Edge exclusions must leave the reconnect registry, not merely stop a socket.
+    FakeWebSocket.sockets = [];
+    appState.callback?.("active");
+    expect(FakeWebSocket.sockets).toEqual([]);
+  });
+
+  it("sends an encrypted v13 ping at fifteen seconds and reconnects after silence", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-14T12:00:00Z"));
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string };
+      negotiatedProtocolVersion: number;
+      lastRecvAt: number;
+      lastPingAt: number;
+      startHeartbeat(): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: vi.fn((message: unknown) => JSON.stringify(message)) };
+    internals.negotiatedProtocolVersion = 13;
+    internals.lastRecvAt = Date.now();
+    internals.lastPingAt = Date.now();
+    internals.startHeartbeat();
+
+    vi.advanceTimersByTime(15_000);
+    expect(socket.sent).toContain('{"type":"connection.ping","id":"ping-0123456789"}');
+    vi.advanceTimersByTime(20_000);
+    expect(socket.readyState).toBe(3);
+    connection.stop();
+  });
+
+  it("carries the selected approval policy in session.create", () => {
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const send = vi.spyOn(connection, "send").mockReturnValue({
+      accepted: true,
+      disposition: "sent",
+    });
+
+    connection.createSession("codex", "/work/prospero", undefined, "structured", 80, 24, {
+      mode: "plan",
+      approvalPolicy: "standard",
+    });
+
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "session.create",
+        agent: "codex",
+        kind: "structured",
+        cwd: "/work/prospero",
+        mode: "plan",
+        approvalPolicy: "standard",
+      }),
+      true,
+    );
+  });
+
+  it("routes a correlated creation result without regressing a newer live state", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws"); socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket; channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>; onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.advertisedCapabilities = new Set([CAPABILITY_SESSION_CREATE_RESULT]);
+    const task = connection.createSessionTracked("codex", "/work", undefined, "structured");
+    expect(JSON.parse(socket.sent[0]!)).toMatchObject({ type: "session.create", requestId: task.requestId });
+    const session = { id: "created-fixture", agent: "codex", kind: "structured", cwd: "/work", title: "Fixture", cols: 80, rows: 24, status: "idle", createdAt: 1 };
+    internals.onMessage(JSON.stringify({ type: "session.state", session }));
+    internals.onMessage(JSON.stringify({ type: "session.create.result", requestId: task.requestId, ok: true, session: { ...session, status: "starting" } }));
+    await expect(task.completion).resolves.toMatchObject({ id: session.id });
+    expect(useApp.getState().runtimes[connection.host.id]?.sessions[session.id]?.status).toBe("idle");
+    connection.stop();
+  });
+
+  it("does not queue a tracked creation offline and terminates waiting on connection stop", async () => {
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const offline = connection.createSessionTracked("codex");
+    await expect(offline.completion).rejects.toMatchObject({ reason: "offline" });
+    expect(connection.queuedCount).toBe(0);
+    vi.spyOn(connection, "send").mockReturnValue({ accepted: true, disposition: "sent" });
+    const task = connection.createSessionTracked("codex");
+    connection.stop();
+    await expect(task.completion).rejects.toMatchObject({ reason: "disconnected" });
+    expect(connection.queuedCount).toBe(0);
+  });
+
+  it("sends explicit API protocols and preserves the key on empty reconfiguration", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = {
+      seal: (message) => JSON.stringify(message),
+      open: (message) => JSON.parse(message),
+    };
+    internals.advertisedCapabilities = new Set([
+      CAPABILITY_AGENT_ACCOUNTS,
+      CAPABILITY_AGENT_API_PROFILES,
+      CAPABILITY_AGENT_API_PROTOCOLS,
+    ]);
+
+    const pending = connection.configureAgentApiProfile(
+      "account",
+      "openai_chat_completions",
+      "https://gateway.example.com/v1",
+      "model",
+    );
+    const request = JSON.parse(socket.sent[0]!) as Record<string, unknown>;
+    expect(request).toMatchObject({
+      type: "agent.account.api.configure",
+      accountId: "account",
+      provider: "openai_compatible",
+      protocol: "openai_chat_completions",
+      baseUrl: "https://gateway.example.com/v1",
+      model: "model",
+    });
+    expect(request).not.toHaveProperty("apiKey");
+    internals.onMessage(JSON.stringify({
+      type: "agent.accounts.result",
+      requestId: request["requestId"],
+      action: "api_configure",
+      ok: true,
+      accounts: [],
+    }));
+    await expect(pending).resolves.toMatchObject({ ok: true });
+    connection.stop();
+  });
+
+  it("keeps legacy API profile updates on the old required-key contract", () => {
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as { advertisedCapabilities: Set<string> };
+    internals.advertisedCapabilities = new Set([
+      CAPABILITY_AGENT_ACCOUNTS,
+      CAPABILITY_AGENT_API_PROFILES,
+    ]);
+    expect(() => connection.configureAgentApiProfile(
+      "account",
+      "openai_responses",
+      "https://gateway.example.com/v1",
+      "model",
+    )).toThrow("需要重新输入 API Key");
+  });
+
+  it("requires advertised API validation and returns failed checks for presentation", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.advertisedCapabilities = new Set([CAPABILITY_AGENT_ACCOUNTS, CAPABILITY_AGENT_API_PROFILES, CAPABILITY_AGENT_API_PROTOCOLS]);
+    expect(connection.supportsAgentApiValidation).toBe(false);
+    expect(() => connection.testAgentApiProfile("account")).toThrow("升级电脑端");
+    expect(socket.sent).toHaveLength(0);
+
+    internals.advertisedCapabilities.add("agent.api-validation.v1");
+    const pending = connection.testAgentApiProfile("account");
+    const request = JSON.parse(socket.sent[0]!);
+    expect(request).toMatchObject({ type: "agent.account.api.test", accountId: "account" });
+    expect(request).not.toHaveProperty("apiKey");
+    const validation = { status: "failed", engine: "opencode", checkedAt: 123, checks: { runtime: "passed", streaming: "passed", tools: "failed" }, detail: "Tool roundtrip failed" };
+    internals.onMessage(JSON.stringify({ type: "agent.accounts.result", requestId: request.requestId, action: "api_test", ok: false, error: "Validation failed", validation, accounts: [] }));
+    await expect(pending).resolves.toMatchObject({ ok: false, validation });
+    connection.stop();
+  });
+
+  it("uses explicit engine scope and a longer budget without confusing protocol results", async () => {
+    vi.useFakeTimers();
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.advertisedCapabilities = new Set([CAPABILITY_AGENT_ACCOUNTS, "agent.api-validation.v1"]);
+    expect(() => connection.testAgentApiProfile("account", "engine")).toThrow("验证 Agent 执行");
+    expect(socket.sent).toHaveLength(0);
+    internals.advertisedCapabilities.add("agent.api-engine-validation.v1");
+    const pending = connection.testAgentApiProfile("account", "engine");
+    const request = JSON.parse(socket.sent.at(-1)!);
+    expect(request).toMatchObject({ type: "agent.account.api.test", accountId: "account", scope: "engine" });
+    await vi.advanceTimersByTimeAsync(46_000);
+    const engineValidation = { status: "failed", engine: "opencode", cliVersion: "1.0", checkedAt: 123, checks: { runtime: "passed", configuration: "passed", streaming: "passed", tools: "failed" }, detail: "Engine tool failed" };
+    internals.onMessage(JSON.stringify({ type: "agent.accounts.result", requestId: request.requestId, action: "api_test", ok: false, error: "Engine failed", engineValidation, accounts: [] }));
+    await expect(pending).resolves.toMatchObject({ ok: false, engineValidation });
+    connection.stop();
+  });
+
+  it("only sends model metadata to daemons advertising support", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.advertisedCapabilities = new Set([CAPABILITY_AGENT_ACCOUNTS, CAPABILITY_AGENT_API_PROFILES, CAPABILITY_AGENT_API_PROTOCOLS]);
+    for (const supported of [false, true]) {
+      if (supported) internals.advertisedCapabilities.add("agent.api-validation.v1");
+      const pending = connection.configureAgentApiProfile("account", "openai_responses", "https://example.com/v1", "model", undefined, { contextWindow: 2000, tools: false });
+      const request = JSON.parse(socket.sent.at(-1)!);
+      if (supported) expect(request.modelCapabilities).toEqual({ contextWindow: 2000, tools: false });
+      else expect(request).not.toHaveProperty("modelCapabilities");
+      internals.onMessage(JSON.stringify({ type: "agent.accounts.result", requestId: request.requestId, action: "api_configure", ok: true, accounts: [] }));
+      await pending;
+    }
+    connection.stop();
+  });
+
+  it("lists and binds model sources through the shared source control channel", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = { seal: JSON.stringify, open: JSON.parse };
+    internals.advertisedCapabilities = new Set([CAPABILITY_MODEL_SOURCES]);
+
+    const pending = connection.modelSourceAction({ kind: "bind", sourceId: "source-1", revision: 2, routeId: "route-1", agent: "codex" });
+    const request = JSON.parse(socket.sent[0]!);
+    expect(request).toMatchObject({
+      type: "model.source.action",
+      action: { kind: "bind", sourceId: "source-1", revision: 2, routeId: "route-1", agent: "codex" },
+    });
+    internals.onMessage(JSON.stringify({
+      type: "model.source.result",
+      requestId: request.requestId,
+      ok: true,
+      accountId: "account-1",
+      accounts: [],
+    }));
+    await expect(pending).resolves.toMatchObject({ ok: true, accountId: "account-1" });
+    connection.stop();
+  });
+
+  it("waits for every acknowledged upload chunk", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = {
+      seal: (message) => JSON.stringify(message),
+      open: (message) => JSON.parse(message),
+    };
+    internals.advertisedCapabilities = new Set([CAPABILITY_FS_PUT_ACK]);
+
+    let settled = false;
+    const pending = connection.fsPutChunk("sid", "file.bin", 0, "AQ==", false)
+      .then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(JSON.parse(socket.sent[0]!)).toMatchObject({ type: "fs.put", final: false });
+
+    internals.onMessage(JSON.stringify({
+      type: "fs.written",
+      sid: "sid",
+      path: "file.bin",
+      size: 1,
+    }));
+    await pending;
+    expect(settled).toBe(true);
+
+    const failed = connection.fsPutChunk("sid", "denied.bin", 0, "Ag==", false);
+    internals.onMessage(JSON.stringify({
+      type: "error",
+      code: "fs_error",
+      message: "cannot write file",
+      sid: "sid",
+    }));
+    await expect(failed).rejects.toThrow("cannot write file");
+    connection.stop();
+  });
+
+  it("uses legacy final acknowledgements to serialize upload chunks", async () => {
+    const socket = new FakeWebSocket("ws://192.168.1.8:7423/ws");
+    socket.readyState = 1;
+    const connection = new HostConnection(makeHost("direct"), generateKeyPairB64());
+    const internals = connection as unknown as {
+      ws: FakeWebSocket;
+      channel: { seal(message: unknown): string; open(message: string): unknown };
+      advertisedCapabilities: Set<string>;
+      onMessage(message: string): void;
+    };
+    internals.ws = socket;
+    internals.channel = {
+      seal: (message) => JSON.stringify(message),
+      open: (message) => JSON.parse(message),
+    };
+    internals.advertisedCapabilities = new Set();
+
+    const pending = connection.fsPutChunk("sid", "file.bin", 0, "AQ==", false);
+    expect(JSON.parse(socket.sent[0]!)).toMatchObject({ type: "fs.put", final: true });
+    internals.onMessage(JSON.stringify({
+      type: "fs.written",
+      sid: "sid",
+      path: "file.bin",
+      size: 1,
+    }));
+    await expect(pending).resolves.toMatchObject({ size: 1 });
+    connection.stop();
+  });
+});

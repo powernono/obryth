@@ -1,0 +1,150 @@
+import type { DesktopSnapshot, JsonObject, SessionCreateInput, SessionInfo } from "./types";
+import { accountCapabilities, accountEngine, type AccountCapabilities } from "./account-capabilities";
+
+export type SessionLaunchWorkspace = {
+  path: string;
+  kind: "project" | "worktree";
+  label: string;
+  detail: string;
+};
+
+export type SessionLaunchAccount = {
+  id: string;
+  name: string;
+  status: string;
+  isDefault: boolean;
+  apiProfile: JsonObject | undefined;
+  engine?: string;
+  capabilities?: AccountCapabilities;
+  apiProfileError?: string;
+};
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function recordValue(value: unknown): JsonObject {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as JsonObject)
+    : {};
+}
+
+function pathLabel(value: string): string {
+  return value.split(/[\\/]/).filter(Boolean).at(-1) ?? value;
+}
+
+/** Mirrors the desktop's existing case-insensitive project matching. */
+export function sessionLaunchPathKey(value: string): string {
+  const normalized = value.replace(/[\\/]+$/, "");
+  return (normalized || value).toLocaleLowerCase();
+}
+
+export function isLaunchableWorktreeAsset(asset: JsonObject): boolean {
+  const state = stringValue(asset["state"]);
+  const path = stringValue(asset["path"]);
+  if (!path || state === "cleaned" || state === "missing") return false;
+  const inspection = recordValue(asset["lastInspection"]);
+  return inspection["pathExists"] !== false;
+}
+
+export function sessionLaunchWorkspaces(
+  snapshot: DesktopSnapshot,
+): SessionLaunchWorkspace[] {
+  const result: SessionLaunchWorkspace[] = [];
+  const seen = new Set<string>();
+  for (const project of snapshot.projects) {
+    const key = sessionLaunchPathKey(project);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({
+      path: project,
+      kind: "project",
+      label:
+        snapshot.projectAliases[key] || pathLabel(project),
+      detail: project,
+    });
+  }
+  for (const asset of snapshot.orchestration.worktreeAssets) {
+    if (!isLaunchableWorktreeAsset(asset)) continue;
+    const path = stringValue(asset["path"]);
+    const key = sessionLaunchPathKey(path);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({
+      path,
+      kind: "worktree",
+      label: stringValue(asset["branch"]) || pathLabel(path),
+      detail: path,
+    });
+  }
+  return result;
+}
+
+export function isSessionLaunchWorkspace(
+  snapshot: DesktopSnapshot,
+  path: string,
+): boolean {
+  const key = sessionLaunchPathKey(path);
+  return sessionLaunchWorkspaces(snapshot).some(
+    (workspace) => sessionLaunchPathKey(workspace.path) === key,
+  ) || snapshot.daemon.sessions.some(session => sessionLaunchPathKey(session.cwd) === key);
+}
+
+export function sessionLaunchAccounts(
+  accounts: JsonObject[],
+  agent: SessionCreateInput["agent"],
+): SessionLaunchAccount[] {
+  if (agent !== "codex" && agent !== "claude" && agent !== "opencode") return [];
+  return accounts.flatMap((account): SessionLaunchAccount[] => {
+    const id = stringValue(account["id"]);
+    const engine = accountEngine(account);
+    if (!id || engine !== agent) return [];
+    const profile = recordValue(account["apiProfile"]);
+    return [{
+      id,
+      name: stringValue(account["name"]) || id,
+      status: stringValue(account["status"]),
+      isDefault: account["isDefault"] === true,
+      apiProfile: Object.keys(profile).length > 0 ? profile : undefined,
+      engine,
+      capabilities: accountCapabilities(account),
+      ...(typeof account["apiProfileError"] === "string" ? { apiProfileError: account["apiProfileError"] } : {}),
+    }];
+  });
+}
+
+export function defaultSessionLaunchAccountId(
+  accounts: JsonObject[],
+  agent: SessionCreateInput["agent"],
+): string | undefined {
+  const matches = sessionLaunchAccounts(accounts, agent);
+  return matches.find((account) => account.isDefault)?.id ?? matches[0]?.id;
+}
+
+export function sessionLaunchRequiresStructured(account?: SessionLaunchAccount): boolean {
+  if (account?.capabilities) return account.capabilities.sessionKinds.includes("structured") && !account.capabilities.sessionKinds.includes("pty");
+  return account?.apiProfile?.["protocol"] === "openai_chat_completions";
+}
+
+export function duplicateSessionAccountState(
+  accounts: JsonObject[],
+  session: Pick<SessionInfo, "accountId">,
+): "legacy" | "ready" | "missing" | "unavailable" {
+  if (!session.accountId) return "legacy";
+  const account = accounts.find((item) => stringValue(item["id"]) === session.accountId);
+  if (!account) return "missing";
+  return stringValue(account["status"]) === "unavailable" ? "unavailable" : "ready";
+}
+
+
+/** Prefer the current local workspace; explicit project actions always win. */
+export function sessionLaunchProject(snapshot: DesktopSnapshot, explicit?: string, activeId?: string): string | undefined {
+  if (explicit !== undefined) return explicit;
+  const active = snapshot.daemon.sessions.find(session => session.id === activeId);
+  if (!active) return undefined;
+  const key = (path: string): string => sessionLaunchPathKey(path.replace(/\\/g, "/"));
+  const cwd = key(active.cwd);
+  return sessionLaunchWorkspaces(snapshot)
+    .filter(workspace => { const path = key(workspace.path); return cwd === path || cwd.startsWith(path.endsWith("/") ? path : `${path}/`); })
+    .sort((a, b) => b.path.length - a.path.length)[0]?.path;
+}

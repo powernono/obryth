@@ -1,0 +1,13 @@
+apply plugin: 'com.android.library'
+apply plugin: 'expo-module-gradle-plugin'
+
+group = 'app.obryth.core'
+version = '0.1.0'
+
+android {
+  namespace 'app.obryth.core'
+  defaultConfig { minSdkVersion 29 }
+  sourceSets.main.java.srcDirs += 'src/main/java/generated'
+  sourceSets.main.jniLibs.srcDirs = ['src/main/jniLibs']
+}
+dependencies { implementation 'net.java.dev.jna:jna:5.17.0@aar' }

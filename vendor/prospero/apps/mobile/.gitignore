@@ -1,0 +1,55 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+example
+
+# generated native folders
+/ios
+/android
+
+# Native Expo modules keep their Gradle intermediates below modules/, not /android.
+/modules/*/android/build/
+
+# build-ipa.sh 产物(.xcarchive / .ipa,几十 MB)
+/build
+
+# Downloaded, checksum-pinned Android offline speech model (bundled into APK).
+/.cache/voice/
+
+# build-ipa.sh 为每台真机记住上次安装的 Bundle ID，防止升级时误换 App 身份。
+/.cache/installed-ios-bundle-id-*

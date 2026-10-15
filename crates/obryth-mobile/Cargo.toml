@@ -1,0 +1,22 @@
+[package]
+name = "obryth-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+obryth-core = { path = "../obryth-core" }
+serde_json.workspace = true
+uniffi = { version = "0.29" }
+thiserror = "2"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
