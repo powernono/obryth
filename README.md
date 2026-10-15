@@ -1,15 +1,11 @@
 # Obryth
 
-[![MIT License](https://img.shields.io/badge/License-MIT-3DA639?style=flat-square)](LICENSE)
-![Development Version](https://img.shields.io/badge/Status-0.1%20Development-E6A23C?style=flat-square)
 [![Rust](https://img.shields.io/badge/Rust-2021-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Tauri 2](https://img.shields.io/badge/Tauri-2-24C8D8?style=flat-square&logo=tauri&logoColor=white)](https://v2.tauri.app/)
 [![React 19](https://img.shields.io/badge/React-19-149ECA?style=flat-square&logo=react&logoColor=white)](https://react.dev/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![SQLite](https://img.shields.io/badge/SQLite-FTS-003B57?style=flat-square&logo=sqlite&logoColor=white)](https://www.sqlite.org/)
-[![Expo](https://img.shields.io/badge/Expo-React%20Native-000020?style=flat-square&logo=expo&logoColor=white)](https://expo.dev/)
+[![Prospero](https://img.shields.io/badge/Prospero-Agent%20%26%20PTY-6D5AE6?style=flat-square&logo=github&logoColor=white)](https://github.com/linn0x/Prospero)
 
-本地优先的笔记、终端与 AI 工作空间。桌面使用 Tauri 2；独立 CLI/TUI 无需图形界面；iOS/Android 工程通过 UniFFI 与 Expo Module 调用相同的 Rust 核心。
+本地优先的笔记、终端与 AI 工作空间。桌面工作区、独立 CLI/TUI 与移动端共用 Rust 知识核心。
 
 当前为可运行的 **0.1 开发版本**。已经实现核心笔记、加密同步、桌面工作区、独立终端入口、API 检索与 Prospero 适配。macOS 已完成本地构建；Windows、iOS/Android 仍需平台验收，完整移动编辑体验与正式签名升级尚未完成。
 
@@ -21,24 +17,11 @@
 - **终端与 Agent**：桌面终端、独立 CLI/TUI，以及基于 Prospero 的会话、任务和审批能力。
 - **API 与同步**：用户配置的模型 API、知识范围检索、MCP、AI 修改审阅与加密 WebDAV 同步。
 
-## 开源项目与技术栈
+## 核心技术与开源基础
 
-感谢以下项目提供的基础能力。徽章可直接访问对应项目；精确依赖版本以 `Cargo.lock` 和 `pnpm-lock.yaml` 为准。
+桌面应用采用 **Tauri 2 + React**，**Rust** 承担本地知识库、同步与 CLI/TUI 能力。**[Prospero](https://github.com/linn0x/Prospero)** 提供 Agent 会话、PTY 终端及加密连接的基础能力。
 
-| 开源项目                                                                                                                                                                               | 在 Obryth 中的用途                                                    |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| [![Prospero](https://img.shields.io/badge/Prospero-Agent%20%26%20PTY-6D5AE6?style=flat-square&logo=github&logoColor=white)](https://github.com/linn0x/Prospero)                        | Rust daemon/client/protocol、Agent 会话与 PTY，以及移动端加密配对协议 |
-| [![Dockview](https://img.shields.io/badge/Dockview-Workspace-4C78A8?style=flat-square)](https://github.com/mathuo/dockview)                                                            | 可恢复的标签、分屏与面板布局                                          |
-| [![Tiptap](https://img.shields.io/badge/Tiptap-Rich%20Text-111111?style=flat-square)](https://github.com/ueberdosis/tiptap)                                                            | 富文本笔记编辑                                                        |
-| [![CodeMirror](https://img.shields.io/badge/CodeMirror-Source%20Editor-D30707?style=flat-square)](https://github.com/codemirror/dev)                                                   | Markdown 源码编辑与 Vim 集成                                          |
-| [![xterm.js](https://img.shields.io/badge/xterm.js-Terminal-2E8B57?style=flat-square)](https://github.com/xtermjs/xterm.js)                                                            | 桌面终端渲染与交互                                                    |
-| [![React Activity Calendar](https://img.shields.io/badge/React%20Activity%20Calendar-Heatmap-149ECA?style=flat-square)](https://github.com/grubersjoe/react-activity-calendar)         | 长时间范围的活动日历；日期筛选与短范围视图由 Obryth 实现              |
-| [![Ratatui](https://img.shields.io/badge/Ratatui-TUI-F5C542?style=flat-square)](https://github.com/ratatui/ratatui)                                                                    | 独立命令行交互界面                                                    |
-| [![UniFFI](https://img.shields.io/badge/UniFFI-Rust%20Bindings-E57200?style=flat-square)](https://github.com/mozilla/uniffi-rs)                                                        | Rust 核心的 Swift/Kotlin 绑定                                         |
-| [![JetBrains Mono](https://img.shields.io/badge/JetBrains%20Mono-Terminal%20Font-000000?style=flat-square&logo=jetbrains&logoColor=white)](https://github.com/JetBrains/JetBrainsMono) | 随应用内置的终端字体                                                  |
-| [![Nerd Fonts](https://img.shields.io/badge/Nerd%20Fonts-Icons-5096FA?style=flat-square)](https://github.com/ryanoasis/nerd-fonts)                                                     | 可选终端图标字体                                                      |
-
-Prospero 以固定源码快照集成，当前提交为 [`b4e3424`](https://github.com/linn0x/Prospero/commit/b4e34246716cb5c74db620554cb9ba6bcfbe0f34)，保留其 MIT 许可证与作者署名。来源和字体许可见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+Prospero 以固定源码快照集成，当前提交为 [`b4e3424`](https://github.com/linn0x/Prospero/commit/b4e34246716cb5c74db620554cb9ba6bcfbe0f34)，保留其 MIT 许可证与作者署名。第三方来源及许可见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 
 ## 快速开始
 
@@ -63,7 +46,7 @@ pnpm desktop
 
 源码模式使用独立的宽版编辑区，行号随位数自然增长；正文由编辑器滚动，支持自动换行、折叠、撤销及 Vim。macOS 的原生窗口按钮与 46 px 顶部工具栏共用垂直中心线。
 
-“设置 → 外观”默认使用雾蓝主题色，提供六种预设、取色器与 HEX 自定义输入；导航、按钮、主页热力图、玻璃光感和跟随外观的终端即时更新，自动保存，并适配深浅外观的对比度。Liquid Glass 覆盖导航、主页、编辑区与右侧面板。“设置 → 终端”提供液态玻璃、跟随外观、午夜、北境、松林、纸笺六套主题；也可以在终端工具栏直接切换。默认使用随包内置的 JetBrains Mono、12 px 字号及 1.6 倍行距，并提供 Nerd Font 图标版本及 11–20 px 字号。字体离线可用，主题与排版即时更新、自动保存，不重启 Shell 会话；系统减少透明度或增强对比度时使用实色。macOS 客户端使用系统材质，浏览器预览使用 CSS 模糊与透明效果。
+“设置 → 外观”默认使用雾蓝主题色，提供六种预设、取色器与 HEX 自定义输入；导航、按钮、主页热力图、玻璃光感和跟随外观的终端即时更新，自动保存，并适配深浅外观的对比度。Liquid Glass 覆盖导航、主页、编辑区与右侧面板。“设置 → 终端”提供液态玻璃、跟随外观、午夜、北境、松林、纸笺六套主题；也可以在终端工具栏直接切换。终端外观即时更新、自动保存，不重启 Shell 会话；系统减少透明度或增强对比度时使用实色。macOS 客户端使用系统材质，浏览器预览使用 CSS 模糊与透明效果。
 
 ## 独立 CLI / TUI
 
@@ -135,18 +118,18 @@ macOS 本地分发包：先构建 release CLI 与标准 `.app`。本地开发包
 
 ## 代码结构
 
-| 路径                   | 职责                                                             |
-| ---------------------- | ---------------------------------------------------------------- |
-| `crates/obryth-core`   | Markdown、SQLite/FTS、历史、冲突、加密 WebDAV、API 与知识检索    |
-| `crates/obryth-cli`    | 本地 RPC 服务、CLI、Ratatui TUI、MCP、PTY 接管、Native Messaging |
-| `crates/obryth-mobile` | UniFFI 接口                                                      |
-| `apps/desktop`         | Tauri、React、Dockview、Tiptap、CodeMirror、xterm                |
-| `apps/mobile`          | React Native、Expo、原生桥接及 Prospero 加密直连                 |
-| `packages`             | Rust 生成的 TypeScript 契约、插件 SDK                            |
-| `vendor/prospero`      | 保留 MIT 许可的 Prospero 固定快照                                |
+| 路径                   | 职责                                                          |
+| ---------------------- | ------------------------------------------------------------- |
+| `crates/obryth-core`   | Markdown、SQLite/FTS、历史、冲突、加密 WebDAV、API 与知识检索 |
+| `crates/obryth-cli`    | 本地 RPC 服务、CLI/TUI、MCP、PTY 接管、Native Messaging       |
+| `crates/obryth-mobile` | 移动端 Rust 接口                                              |
+| `apps/desktop`         | 桌面界面、编辑器、多面板工作区与终端                          |
+| `apps/mobile`          | 移动端界面、原生桥接及 Prospero 加密直连                      |
+| `packages`             | Rust 生成的 TypeScript 契约、插件 SDK                         |
+| `vendor/prospero`      | 保留 MIT 许可的 Prospero 固定快照                             |
 
 没有内置模型下载、推理引擎或默认本地 embedding 模型。
 
 ## 许可证
 
-Obryth 使用 [MIT License](LICENSE)。第三方源码、字体与依赖遵循各自的许可证，来源与随包许可说明见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+Obryth 使用 [MIT License](LICENSE)。第三方依赖遵循各自的许可证，来源与随包许可说明见 [THIRD_PARTY.md](THIRD_PARTY.md)。
